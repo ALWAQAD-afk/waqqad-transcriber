@@ -1,136 +1,109 @@
 import os
 import uuid
+import json
 import time
-import shutil
+import threading
 import subprocess
-import requests
+from pathlib import Path
 
+import requests
 from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
 
-# ============================================================
-# SETTINGS
-# ============================================================
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 
 CHUNK_MINUTES = 10
 MAX_RETRIES = 5
+REQUEST_TIMEOUT = 1800
 
-DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
-DEEPGRAM_MODEL = "nova-3"
-DEEPGRAM_LANGUAGE = "ar"
-
-# لا نضع API Key داخل الكود
-DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
+jobs = {}
+jobs_lock = threading.Lock()
 
 
 # ============================================================
-# BASIC ROUTES
+# JOB STATUS
 # ============================================================
 
-@app.route("/")
-def home():
-    return "Waqqad Transcriber is alive."
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "service": "waqqad-transcriber"
-    })
+def update_job(job_id, **updates):
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id].update(updates)
 
 
 # ============================================================
-# HELPERS
+# RUN COMMAND
 # ============================================================
 
-def run_command(command):
-    """
-    Run a system command and raise an error if it fails.
-    """
+def run_command(cmd):
+    print(f"[CMD] {' '.join(cmd)}", flush=True)
 
-    print("\n[CMD]", " ".join(command), flush=True)
-
-    process = subprocess.run(
-        command,
+    result = subprocess.run(
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True
     )
 
-    if process.returncode != 0:
-        print(process.stderr, flush=True)
-
+    if result.returncode != 0:
+        print("[CMD ERROR]", flush=True)
+        print(result.stderr, flush=True)
         raise RuntimeError(
-            f"Command failed with exit code {process.returncode}"
+            f"Command failed with exit code {result.returncode}"
         )
 
-    return process
+    return result.stdout.strip()
 
+
+# ============================================================
+# GET MEDIA DURATION
+# ============================================================
 
 def get_duration(file_path):
-    """
-    Get media duration using ffprobe.
-    """
-
-    command = [
+    output = run_command([
         "ffprobe",
         "-v", "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        file_path
-    ]
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(file_path)
+    ])
 
-    result = run_command(command)
+    return float(output)
 
-    return float(result.stdout.strip())
 
+# ============================================================
+# SPLIT AUDIO
+# ============================================================
 
 def split_audio(input_file, chunks_dir):
-    """
-    Split audio into 10-minute mono 16k FLAC chunks.
-    """
 
-    os.makedirs(chunks_dir, exist_ok=True)
+    chunks_dir.mkdir(parents=True, exist_ok=True)
 
-    output_pattern = os.path.join(
-        chunks_dir,
-        "chunk_%04d.flac"
+    print(
+        f"[FFMPEG] Splitting into {CHUNK_MINUTES}-minute chunks...",
+        flush=True
     )
 
-    command = [
+    run_command([
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
-
-        "-i",
-        input_file,
-
+        "-i", str(input_file),
         "-vn",
-
         "-ac", "1",
         "-ar", "16000",
-
         "-f", "segment",
         "-segment_time", str(CHUNK_MINUTES * 60),
         "-reset_timestamps", "1",
+        str(chunks_dir / "chunk_%04d.flac")
+    ])
 
-        output_pattern
-    ]
+    chunks = sorted(chunks_dir.glob("chunk_*.flac"))
 
-    run_command(command)
-
-    chunks = sorted(
-        os.path.join(chunks_dir, f)
-        for f in os.listdir(chunks_dir)
-        if f.endswith(".flac")
+    print(
+        f"[FFMPEG] Created {len(chunks)} chunks.",
+        flush=True
     )
-
-    if not chunks:
-        raise RuntimeError("FFmpeg created no chunks.")
 
     return chunks
 
@@ -139,222 +112,123 @@ def split_audio(input_file, chunks_dir):
 # DEEPGRAM
 # ============================================================
 
-def transcribe_chunk(chunk_path, index, total):
-    """
-    Send one audio chunk to Deepgram with retries.
-    """
+def transcribe_chunk(chunk_path):
 
-    if not DEEPGRAM_API_KEY:
-        raise RuntimeError(
-            "DEEPGRAM_API_KEY environment variable is missing."
-        )
+    url = "https://api.deepgram.com/v1/listen"
 
-    print(
-        f"\n[DEEPGRAM] Chunk {index}/{total}",
-        flush=True
-    )
-
-    with open(chunk_path, "rb") as audio_file:
-        audio_data = audio_file.read()
+    params = {
+        "model": "nova-3",
+        "language": "ar",
+        "smart_format": "true"
+    }
 
     headers = {
         "Authorization": f"Token {DEEPGRAM_API_KEY}",
         "Content-Type": "audio/flac"
     }
 
-    params = {
-        "model": DEEPGRAM_MODEL,
-        "language": DEEPGRAM_LANGUAGE,
-        "smart_format": "true"
-    }
+    with open(chunk_path, "rb") as audio:
 
-    for attempt in range(1, MAX_RETRIES + 1):
+        response = requests.post(
+            url,
+            params=params,
+            headers=headers,
+            data=audio,
+            timeout=REQUEST_TIMEOUT
+        )
 
-        try:
-
-            print(
-                f"[DEEPGRAM] Attempt {attempt}/{MAX_RETRIES}",
-                flush=True
-            )
-
-            response = requests.post(
-                DEEPGRAM_URL,
-                headers=headers,
-                params=params,
-                data=audio_data,
-                timeout=1800
-            )
-
-            print(
-                f"[DEEPGRAM] HTTP {response.status_code}",
-                flush=True
-            )
-
-            if response.status_code == 200:
-
-                data = response.json()
-
-                transcript = (
-                    data
-                    .get("results", {})
-                    .get("channels", [{}])[0]
-                    .get("alternatives", [{}])[0]
-                    .get("transcript", "")
-                )
-
-                return transcript.strip()
-
-            print(
-                response.text[:1000],
-                flush=True
-            )
-
-        except Exception as e:
-
-            print(
-                f"[DEEPGRAM] Error: {e}",
-                flush=True
-            )
-
-        if attempt < MAX_RETRIES:
-
-            wait_time = 2 ** attempt
-
-            print(
-                f"[DEEPGRAM] Waiting {wait_time}s...",
-                flush=True
-            )
-
-            time.sleep(wait_time)
-
-    raise RuntimeError(
-        f"Deepgram failed after {MAX_RETRIES} attempts."
+    print(
+        f"[DEEPGRAM] HTTP {response.status_code}",
+        flush=True
     )
+
+    if response.status_code != 200:
+        print(response.text[:1000], flush=True)
+
+        raise RuntimeError(
+            f"Deepgram HTTP {response.status_code}"
+        )
+
+    data = response.json()
+
+    try:
+        return data["results"]["channels"][0]["alternatives"][0]["transcript"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(
+            "Unexpected Deepgram response format"
+        )
 
 
 # ============================================================
-# TRANSCRIBE
+# PROCESS JOB
 # ============================================================
 
-@app.route("/transcribe", methods=["POST"])
-def transcribe():
+def process_job(job_id, input_file):
 
-    print("\n========================================", flush=True)
-    print("[TRANSCRIBE] New request", flush=True)
-    print("========================================", flush=True)
+    work_dir = input_file.parent.parent
 
-    # --------------------------------------------------------
-    # Check upload
-    # --------------------------------------------------------
+    chunks_dir = work_dir / "chunks"
+    texts_dir = work_dir / "texts"
 
-    if "file" not in request.files:
-
-        return jsonify({
-            "error": "No file uploaded."
-        }), 400
-
-    uploaded_file = request.files["file"]
-
-    if uploaded_file.filename == "":
-
-        return jsonify({
-            "error": "Empty filename."
-        }), 400
-
-    # --------------------------------------------------------
-    # Create job directory
-    # --------------------------------------------------------
-
-    job_id = str(uuid.uuid4())
-
-    work_dir = os.path.join(
-        "/tmp",
-        f"waqqad_{job_id}"
-    )
-
-    os.makedirs(work_dir, exist_ok=True)
-
-    original_dir = os.path.join(work_dir, "original")
-    chunks_dir = os.path.join(work_dir, "chunks")
-    texts_dir = os.path.join(work_dir, "texts")
-
-    os.makedirs(original_dir, exist_ok=True)
-    os.makedirs(chunks_dir, exist_ok=True)
-    os.makedirs(texts_dir, exist_ok=True)
-
-    original_file = os.path.join(
-        original_dir,
-        uploaded_file.filename
-    )
+    texts_dir.mkdir(parents=True, exist_ok=True)
 
     try:
 
-        # ----------------------------------------------------
-        # Save uploaded file
-        # ----------------------------------------------------
-
-        print(
-            f"[UPLOAD] Saving: {uploaded_file.filename}",
-            flush=True
+        update_job(
+            job_id,
+            status="processing",
+            stage="duration"
         )
 
-        uploaded_file.save(original_file)
-
-        file_size = os.path.getsize(original_file)
-
-        print(
-            f"[UPLOAD] Size: {file_size / (1024 * 1024):.2f} MB",
-            flush=True
-        )
-
-        # ----------------------------------------------------
-        # Duration
-        # ----------------------------------------------------
-
-        duration = get_duration(original_file)
+        duration = get_duration(input_file)
 
         print(
             f"[MEDIA] Duration: {duration / 60:.2f} minutes",
             flush=True
         )
 
-        # ----------------------------------------------------
-        # Split
-        # ----------------------------------------------------
-
-        print(
-            f"[FFMPEG] Splitting into {CHUNK_MINUTES}-minute chunks...",
-            flush=True
+        update_job(
+            job_id,
+            duration_minutes=round(duration / 60, 2),
+            stage="splitting"
         )
 
         chunks = split_audio(
-            original_file,
+            input_file,
             chunks_dir
         )
 
         total_chunks = len(chunks)
 
-        print(
-            f"[FFMPEG] Created {total_chunks} chunks.",
-            flush=True
+        update_job(
+            job_id,
+            total_chunks=total_chunks,
+            completed_chunks=0,
+            stage="transcription"
         )
 
+        transcripts = []
+
         # ----------------------------------------------------
-        # Transcribe chunks
+        # TRANSCRIBE CHUNKS
         # ----------------------------------------------------
 
-        for index, chunk_path in enumerate(chunks, start=1):
+        for index, chunk in enumerate(chunks, start=1):
 
-            checkpoint_file = os.path.join(
-                texts_dir,
-                f"chunk_{index:04d}.txt"
+            text_file = texts_dir / f"chunk_{index:04d}.txt"
+
+            update_job(
+                job_id,
+                current_chunk=index
             )
 
-            # -----------------------------------------------
-            # Checkpoint
-            # -----------------------------------------------
+            print(
+                f"[DEEPGRAM] Chunk {index}/{total_chunks}",
+                flush=True
+            )
 
-            if os.path.exists(checkpoint_file):
+            # Checkpoint
+            if text_file.exists():
 
                 print(
                     f"[CHECKPOINT] Chunk {index}/{total_chunks} "
@@ -362,162 +236,297 @@ def transcribe():
                     flush=True
                 )
 
-                continue
+                text = text_file.read_text(
+                    encoding="utf-8"
+                )
 
-            # -----------------------------------------------
-            # Transcribe
-            # -----------------------------------------------
+            else:
 
-            transcript = transcribe_chunk(
-                chunk_path,
-                index,
-                total_chunks
-            )
+                text = None
 
-            # -----------------------------------------------
-            # Save checkpoint
-            # -----------------------------------------------
+                for attempt in range(1, MAX_RETRIES + 1):
 
-            with open(
-                checkpoint_file,
-                "w",
-                encoding="utf-8"
-            ) as text_file:
+                    try:
 
-                text_file.write(transcript)
+                        print(
+                            f"[DEEPGRAM] Attempt "
+                            f"{attempt}/{MAX_RETRIES}",
+                            flush=True
+                        )
 
-            print(
-                f"[CHECKPOINT] Chunk {index}/{total_chunks} saved.",
-                flush=True
+                        text = transcribe_chunk(chunk)
+
+                        break
+
+                    except Exception as e:
+
+                        print(
+                            f"[DEEPGRAM ERROR] {e}",
+                            flush=True
+                        )
+
+                        if attempt == MAX_RETRIES:
+                            raise
+
+                        wait_time = 2 ** attempt
+
+                        print(
+                            f"[RETRY] Waiting "
+                            f"{wait_time}s...",
+                            flush=True
+                        )
+
+                        time.sleep(wait_time)
+
+                text_file.write_text(
+                    text,
+                    encoding="utf-8"
+                )
+
+                print(
+                    f"[CHECKPOINT] Chunk "
+                    f"{index}/{total_chunks} saved.",
+                    flush=True
+                )
+
+            transcripts.append(text)
+
+            update_job(
+                job_id,
+                completed_chunks=index
             )
 
         # ----------------------------------------------------
-        # Merge
+        # MERGE
         # ----------------------------------------------------
+
+        update_job(
+            job_id,
+            stage="merging"
+        )
 
         print(
-            "\n[MERGE] Combining transcripts...",
+            "[MERGE] Combining transcripts...",
             flush=True
         )
 
-        final_text = []
+        final_text = "\n\n".join(transcripts)
 
-        for index in range(1, total_chunks + 1):
+        output_file = work_dir / "transcription.txt"
 
-            checkpoint_file = os.path.join(
-                texts_dir,
-                f"chunk_{index:04d}.txt"
-            )
-
-            if not os.path.exists(checkpoint_file):
-
-                raise RuntimeError(
-                    f"Missing checkpoint for chunk {index}."
-                )
-
-            with open(
-                checkpoint_file,
-                "r",
-                encoding="utf-8"
-            ) as text_file:
-
-                text = text_file.read().strip()
-
-            if text:
-                final_text.append(text)
-
-        merged_text = "\n\n".join(final_text)
-
-        # ----------------------------------------------------
-        # Save result
-        # ----------------------------------------------------
-
-        result_file = os.path.join(
-            work_dir,
-            "result.txt"
-        )
-
-        with open(
-            result_file,
-            "w",
+        output_file.write_text(
+            final_text,
             encoding="utf-8"
-        ) as text_file:
-
-            text_file.write(merged_text)
-
-        print(
-            "\n========================================",
-            flush=True
-        )
-
-        print(
-            "[DONE] Transcription completed.",
-            flush=True
-        )
-
-        print(
-            f"[DONE] Job: {job_id}",
-            flush=True
-        )
-
-        print(
-            f"[DONE] Chunks: {total_chunks}",
-            flush=True
-        )
-
-        print(
-            "========================================\n",
-            flush=True
         )
 
         # ----------------------------------------------------
-        # Return TXT
+        # DONE
         # ----------------------------------------------------
 
-        response = send_file(
-            result_file,
-            as_attachment=True,
-            download_name="transcription.txt",
-            mimetype="text/plain; charset=utf-8"
+        update_job(
+            job_id,
+            status="completed",
+            stage="done",
+            output_file=str(output_file)
         )
 
-        # Delete after response closes
-        @response.call_on_close
-        def cleanup():
-
-            try:
-                shutil.rmtree(work_dir)
-
-                print(
-                    f"[CLEANUP] Removed {work_dir}",
-                    flush=True
-                )
-
-            except Exception as e:
-
-                print(
-                    f"[CLEANUP] Failed: {e}",
-                    flush=True
-                )
-
-        return response
+        print("========================================", flush=True)
+        print("[DONE] Transcription completed.", flush=True)
+        print(f"[DONE] Job: {job_id}", flush=True)
+        print(f"[DONE] Chunks: {total_chunks}", flush=True)
+        print("========================================", flush=True)
 
     except Exception as e:
 
-        print(
-            "\n[ERROR]",
-            str(e),
-            flush=True
+        print("========================================", flush=True)
+        print("[ERROR] Job failed.", flush=True)
+        print(f"[ERROR] Job: {job_id}", flush=True)
+        print(f"[ERROR] {e}", flush=True)
+        print("========================================", flush=True)
+
+        update_job(
+            job_id,
+            status="failed",
+            stage="error",
+            error=str(e)
         )
 
-        # Keep the work directory on failure.
-        # This allows us to inspect checkpoints/logs
-        # before the next test.
 
+# ============================================================
+# HOME
+# ============================================================
+
+@app.route("/")
+def home():
+    return jsonify({
+        "service": "Waqqad Transcriber",
+        "status": "online"
+    })
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok"
+    })
+
+
+# ============================================================
+# START TRANSCRIPTION JOB
+# ============================================================
+
+@app.route("/transcribe", methods=["POST"])
+def transcribe():
+
+    print("========================================", flush=True)
+    print("[TRANSCRIBE] New request", flush=True)
+    print("========================================", flush=True)
+
+    if "file" not in request.files:
         return jsonify({
-            "error": str(e),
-            "job_id": job_id
-        }), 500
+            "error": "No file provided"
+        }), 400
+
+    uploaded_file = request.files["file"]
+
+    if not uploaded_file.filename:
+        return jsonify({
+            "error": "Empty filename"
+        }), 400
+
+    # --------------------------------------------------------
+    # JOB ID
+    # --------------------------------------------------------
+
+    job_id = str(uuid.uuid4())
+
+    work_dir = Path("/tmp") / f"waqqad_{job_id}"
+
+    original_dir = work_dir / "original"
+
+    original_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    input_file = original_dir / uploaded_file.filename
+
+    # --------------------------------------------------------
+    # SAVE UPLOAD
+    # --------------------------------------------------------
+
+    print(
+        f"[UPLOAD] Saving: {uploaded_file.filename}",
+        flush=True
+    )
+
+    uploaded_file.save(input_file)
+
+    file_size = input_file.stat().st_size
+
+    print(
+        f"[UPLOAD] Size: "
+        f"{file_size / (1024 * 1024):.2f} MB",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # REGISTER JOB
+    # --------------------------------------------------------
+
+    with jobs_lock:
+
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "stage": "queued",
+            "current_chunk": 0,
+            "completed_chunks": 0,
+            "total_chunks": 0,
+            "duration_minutes": None,
+            "error": None,
+            "output_file": None
+        }
+
+    # --------------------------------------------------------
+    # BACKGROUND THREAD
+    # --------------------------------------------------------
+
+    thread = threading.Thread(
+        target=process_job,
+        args=(job_id, input_file),
+        daemon=True
+    )
+
+    thread.start()
+
+    # --------------------------------------------------------
+    # RESPOND IMMEDIATELY
+    # --------------------------------------------------------
+
+    return jsonify({
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Transcription job started."
+    }), 202
+
+
+# ============================================================
+# JOB STATUS
+# ============================================================
+
+@app.route("/status/<job_id>", methods=["GET"])
+def job_status(job_id):
+
+    with jobs_lock:
+        job = jobs.get(job_id)
+
+    if job is None:
+        return jsonify({
+            "error": "Job not found"
+        }), 404
+
+    return jsonify(job)
+
+
+# ============================================================
+# DOWNLOAD RESULT
+# ============================================================
+
+@app.route("/download/<job_id>", methods=["GET"])
+def download_result(job_id):
+
+    with jobs_lock:
+        job = jobs.get(job_id)
+
+    if job is None:
+        return jsonify({
+            "error": "Job not found"
+        }), 404
+
+    if job["status"] != "completed":
+        return jsonify({
+            "error": "Job is not completed yet",
+            "status": job["status"]
+        }), 409
+
+    output_file = job.get("output_file")
+
+    if not output_file or not os.path.exists(output_file):
+        return jsonify({
+            "error": "Output file not found"
+        }), 404
+
+    return send_file(
+        output_file,
+        as_attachment=True,
+        download_name="transcription.txt",
+        mimetype="text/plain"
+    )
 
 
 # ============================================================
@@ -526,14 +535,7 @@ def transcribe():
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
     app.run(
         host="0.0.0.0",
-        port=port
+        port=10000
     )
