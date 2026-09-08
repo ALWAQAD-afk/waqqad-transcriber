@@ -6,7 +6,6 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
-
 DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
 
 
@@ -25,6 +24,7 @@ def health():
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
+
     if not DEEPGRAM_API_KEY:
         return jsonify({
             "error": "DEEPGRAM_API_KEY is not configured"
@@ -43,6 +43,7 @@ def transcribe():
         }), 400
 
     try:
+
         audio_data = uploaded_file.read()
 
         response = requests.post(
@@ -54,7 +55,10 @@ def transcribe():
             },
             headers={
                 "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                "Content-Type": uploaded_file.content_type or "application/octet-stream"
+                "Content-Type": (
+                    uploaded_file.content_type
+                    or "application/octet-stream"
+                )
             },
             data=audio_data,
             timeout=1800
@@ -84,12 +88,14 @@ def transcribe():
         })
 
     except requests.RequestException as e:
+
         return jsonify({
             "error": "Network error while contacting Deepgram",
             "details": str(e)
         }), 502
 
     except Exception as e:
+
         return jsonify({
             "error": "Unexpected server error",
             "details": str(e)
@@ -97,5 +103,10 @@ def transcribe():
 
 
 if __name__ == "__main__":
+
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
