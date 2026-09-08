@@ -5,16 +5,28 @@ import shutil
 import subprocess
 import requests
 
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
 
-DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
+# ============================================================
+# SETTINGS
+# ============================================================
 
 CHUNK_MINUTES = 10
 MAX_RETRIES = 5
-REQUEST_TIMEOUT = 1800
 
+DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
+DEEPGRAM_MODEL = "nova-3"
+DEEPGRAM_LANGUAGE = "ar"
+
+# لا نضع API Key داخل الكود
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
+
+
+# ============================================================
+# BASIC ROUTES
+# ============================================================
 
 @app.route("/")
 def home():
@@ -25,26 +37,242 @@ def home():
 def health():
     return jsonify({
         "status": "ok",
-        "deepgram_key": bool(DEEPGRAM_API_KEY)
+        "service": "waqqad-transcriber"
     })
 
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def run_command(command):
+    """
+    Run a system command and raise an error if it fails.
+    """
+
+    print("\n[CMD]", " ".join(command), flush=True)
+
+    process = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if process.returncode != 0:
+        print(process.stderr, flush=True)
+
+        raise RuntimeError(
+            f"Command failed with exit code {process.returncode}"
+        )
+
+    return process
+
+
+def get_duration(file_path):
+    """
+    Get media duration using ffprobe.
+    """
+
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        file_path
+    ]
+
+    result = run_command(command)
+
+    return float(result.stdout.strip())
+
+
+def split_audio(input_file, chunks_dir):
+    """
+    Split audio into 10-minute mono 16k FLAC chunks.
+    """
+
+    os.makedirs(chunks_dir, exist_ok=True)
+
+    output_pattern = os.path.join(
+        chunks_dir,
+        "chunk_%04d.flac"
+    )
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+
+        "-i",
+        input_file,
+
+        "-vn",
+
+        "-ac", "1",
+        "-ar", "16000",
+
+        "-f", "segment",
+        "-segment_time", str(CHUNK_MINUTES * 60),
+        "-reset_timestamps", "1",
+
+        output_pattern
+    ]
+
+    run_command(command)
+
+    chunks = sorted(
+        os.path.join(chunks_dir, f)
+        for f in os.listdir(chunks_dir)
+        if f.endswith(".flac")
+    )
+
+    if not chunks:
+        raise RuntimeError("FFmpeg created no chunks.")
+
+    return chunks
+
+
+# ============================================================
+# DEEPGRAM
+# ============================================================
+
+def transcribe_chunk(chunk_path, index, total):
+    """
+    Send one audio chunk to Deepgram with retries.
+    """
+
+    if not DEEPGRAM_API_KEY:
+        raise RuntimeError(
+            "DEEPGRAM_API_KEY environment variable is missing."
+        )
+
+    print(
+        f"\n[DEEPGRAM] Chunk {index}/{total}",
+        flush=True
+    )
+
+    with open(chunk_path, "rb") as audio_file:
+        audio_data = audio_file.read()
+
+    headers = {
+        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Content-Type": "audio/flac"
+    }
+
+    params = {
+        "model": DEEPGRAM_MODEL,
+        "language": DEEPGRAM_LANGUAGE,
+        "smart_format": "true"
+    }
+
+    for attempt in range(1, MAX_RETRIES + 1):
+
+        try:
+
+            print(
+                f"[DEEPGRAM] Attempt {attempt}/{MAX_RETRIES}",
+                flush=True
+            )
+
+            response = requests.post(
+                DEEPGRAM_URL,
+                headers=headers,
+                params=params,
+                data=audio_data,
+                timeout=1800
+            )
+
+            print(
+                f"[DEEPGRAM] HTTP {response.status_code}",
+                flush=True
+            )
+
+            if response.status_code == 200:
+
+                data = response.json()
+
+                transcript = (
+                    data
+                    .get("results", {})
+                    .get("channels", [{}])[0]
+                    .get("alternatives", [{}])[0]
+                    .get("transcript", "")
+                )
+
+                return transcript.strip()
+
+            print(
+                response.text[:1000],
+                flush=True
+            )
+
+        except Exception as e:
+
+            print(
+                f"[DEEPGRAM] Error: {e}",
+                flush=True
+            )
+
+        if attempt < MAX_RETRIES:
+
+            wait_time = 2 ** attempt
+
+            print(
+                f"[DEEPGRAM] Waiting {wait_time}s...",
+                flush=True
+            )
+
+            time.sleep(wait_time)
+
+    raise RuntimeError(
+        f"Deepgram failed after {MAX_RETRIES} attempts."
+    )
+
+
+# ============================================================
+# TRANSCRIBE
+# ============================================================
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
 
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+    print("\n========================================", flush=True)
+    print("[TRANSCRIBE] New request", flush=True)
+    print("========================================", flush=True)
 
-    if not DEEPGRAM_API_KEY:
-        return jsonify({"error": "DEEPGRAM_API_KEY is not configured"}), 500
+    # --------------------------------------------------------
+    # Check upload
+    # --------------------------------------------------------
+
+    if "file" not in request.files:
+
+        return jsonify({
+            "error": "No file uploaded."
+        }), 400
 
     uploaded_file = request.files["file"]
 
-    if not uploaded_file.filename:
-        return jsonify({"error": "Empty filename"}), 400
+    if uploaded_file.filename == "":
+
+        return jsonify({
+            "error": "Empty filename."
+        }), 400
+
+    # --------------------------------------------------------
+    # Create job directory
+    # --------------------------------------------------------
 
     job_id = str(uuid.uuid4())
-    work_dir = f"/tmp/waqqad_{job_id}"
+
+    work_dir = os.path.join(
+        "/tmp",
+        f"waqqad_{job_id}"
+    )
+
+    os.makedirs(work_dir, exist_ok=True)
 
     original_dir = os.path.join(work_dir, "original")
     chunks_dir = os.path.join(work_dir, "chunks")
@@ -61,311 +289,251 @@ def transcribe():
 
     try:
 
-        # --------------------------------------------------
-        # 1. Save uploaded file
-        # --------------------------------------------------
+        # ----------------------------------------------------
+        # Save uploaded file
+        # ----------------------------------------------------
 
-        print(f"[1/5] Saving upload: {uploaded_file.filename}")
+        print(
+            f"[UPLOAD] Saving: {uploaded_file.filename}",
+            flush=True
+        )
 
         uploaded_file.save(original_file)
 
         file_size = os.path.getsize(original_file)
 
         print(
-            f"[UPLOAD] Saved {file_size / (1024 * 1024):.2f} MB"
+            f"[UPLOAD] Size: {file_size / (1024 * 1024):.2f} MB",
+            flush=True
         )
 
-        # --------------------------------------------------
-        # 2. Get duration
-        # --------------------------------------------------
+        # ----------------------------------------------------
+        # Duration
+        # ----------------------------------------------------
 
-        print("[2/5] Detecting duration...")
-
-        duration_cmd = [
-            "ffprobe",
-            "-v", "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            original_file
-        ]
-
-        duration_result = subprocess.run(
-            duration_cmd,
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-
-        if duration_result.returncode != 0:
-            return jsonify({
-                "error": "Could not detect audio duration",
-                "details": duration_result.stderr
-            }), 500
-
-        duration = float(duration_result.stdout.strip())
+        duration = get_duration(original_file)
 
         print(
-            f"[DURATION] {duration / 3600:.2f} hours "
-            f"({duration / 60:.1f} minutes)"
+            f"[MEDIA] Duration: {duration / 60:.2f} minutes",
+            flush=True
         )
 
-        # --------------------------------------------------
-        # 3. Split into 10-minute FLAC chunks
-        # --------------------------------------------------
+        # ----------------------------------------------------
+        # Split
+        # ----------------------------------------------------
 
-        print("[3/5] Splitting audio...")
-
-        chunk_pattern = os.path.join(
-            chunks_dir,
-            "chunk_%04d.flac"
+        print(
+            f"[FFMPEG] Splitting into {CHUNK_MINUTES}-minute chunks...",
+            flush=True
         )
 
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
+        chunks = split_audio(
             original_file,
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "flac",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(CHUNK_MINUTES * 60),
-            "-reset_timestamps",
-            "1",
-            chunk_pattern
-        ]
-
-        ffmpeg_result = subprocess.run(
-            ffmpeg_cmd,
-            capture_output=True,
-            text=True,
-            timeout=7200
+            chunks_dir
         )
 
-        if ffmpeg_result.returncode != 0:
-            return jsonify({
-                "error": "FFmpeg failed",
-                "details": ffmpeg_result.stderr[-4000:]
-            }), 500
-
-        chunks = sorted(
-            os.path.join(chunks_dir, f)
-            for f in os.listdir(chunks_dir)
-            if f.endswith(".flac")
-        )
-
-        if not chunks:
-            return jsonify({
-                "error": "No audio chunks were created"
-            }), 500
+        total_chunks = len(chunks)
 
         print(
-            f"[CHUNKS] Created {len(chunks)} chunks"
+            f"[FFMPEG] Created {total_chunks} chunks.",
+            flush=True
         )
 
-        # --------------------------------------------------
-        # 4. Transcribe chunks
-        # --------------------------------------------------
+        # ----------------------------------------------------
+        # Transcribe chunks
+        # ----------------------------------------------------
 
-        print("[4/5] Starting Deepgram transcription...")
+        for index, chunk_path in enumerate(chunks, start=1):
 
-        headers = {
-            "Authorization": f"Token {DEEPGRAM_API_KEY}",
-            "Content-Type": "audio/flac"
-        }
-
-        texts = []
-
-        for index, chunk_path in enumerate(chunks):
-
-            chunk_number = index + 1
-
-            checkpoint = os.path.join(
+            checkpoint_file = os.path.join(
                 texts_dir,
-                f"chunk_{chunk_number:04d}.txt"
+                f"chunk_{index:04d}.txt"
             )
 
-            # ----------------------------------------------
+            # -----------------------------------------------
             # Checkpoint
-            # ----------------------------------------------
+            # -----------------------------------------------
 
-            if os.path.exists(checkpoint):
+            if os.path.exists(checkpoint_file):
 
                 print(
-                    f"[{chunk_number}/{len(chunks)}] "
-                    f"Checkpoint found — skipping"
+                    f"[CHECKPOINT] Chunk {index}/{total_chunks} "
+                    f"already exists. Skipping.",
+                    flush=True
                 )
-
-                with open(
-                    checkpoint,
-                    "r",
-                    encoding="utf-8"
-                ) as f:
-                    text = f.read()
-
-                texts.append(text)
 
                 continue
 
-            print(
-                f"[{chunk_number}/{len(chunks)}] "
-                f"Sending to Deepgram..."
+            # -----------------------------------------------
+            # Transcribe
+            # -----------------------------------------------
+
+            transcript = transcribe_chunk(
+                chunk_path,
+                index,
+                total_chunks
             )
 
-            success = False
-            text = ""
+            # -----------------------------------------------
+            # Save checkpoint
+            # -----------------------------------------------
 
-            for attempt in range(1, MAX_RETRIES + 1):
+            with open(
+                checkpoint_file,
+                "w",
+                encoding="utf-8"
+            ) as text_file:
 
-                try:
+                text_file.write(transcript)
 
-                    start_time = time.time()
+            print(
+                f"[CHECKPOINT] Chunk {index}/{total_chunks} saved.",
+                flush=True
+            )
 
-                    with open(
-                        chunk_path,
-                        "rb"
-                    ) as audio:
+        # ----------------------------------------------------
+        # Merge
+        # ----------------------------------------------------
 
-                        response = requests.post(
-                            "https://api.deepgram.com/v1/listen",
-                            headers=headers,
-                            params={
-                                "model": "nova-3",
-                                "language": "ar",
-                                "smart_format": "true"
-                            },
-                            data=audio,
-                            timeout=REQUEST_TIMEOUT
-                        )
+        print(
+            "\n[MERGE] Combining transcripts...",
+            flush=True
+        )
 
-                    elapsed = time.time() - start_time
+        final_text = []
 
-                    print(
-                        f"[{chunk_number}] "
-                        f"Attempt {attempt}: "
-                        f"HTTP {response.status_code} "
-                        f"in {elapsed:.1f}s"
-                    )
+        for index in range(1, total_chunks + 1):
 
-                    if response.status_code == 200:
+            checkpoint_file = os.path.join(
+                texts_dir,
+                f"chunk_{index:04d}.txt"
+            )
 
-                        data = response.json()
+            if not os.path.exists(checkpoint_file):
 
-                        text = (
-                            data
-                            .get("results", {})
-                            .get("channels", [{}])[0]
-                            .get("alternatives", [{}])[0]
-                            .get("transcript", "")
-                        )
-
-                        with open(
-                            checkpoint,
-                            "w",
-                            encoding="utf-8"
-                        ) as f:
-                            f.write(text)
-
-                        print(
-                            f"[{chunk_number}] "
-                            f"Saved checkpoint."
-                        )
-
-                        success = True
-                        break
-
-                    else:
-
-                        print(
-                            f"[{chunk_number}] "
-                            f"Deepgram error: "
-                            f"{response.text[:1000]}"
-                        )
-
-                except Exception as e:
-
-                    print(
-                        f"[{chunk_number}] "
-                        f"Attempt {attempt} failed: {e}"
-                    )
-
-                if attempt < MAX_RETRIES:
-
-                    wait_time = 2 ** attempt
-
-                    print(
-                        f"[{chunk_number}] "
-                        f"Retrying in {wait_time}s..."
-                    )
-
-                    time.sleep(wait_time)
-
-            if not success:
-
-                print(
-                    f"[ERROR] Chunk {chunk_number} "
-                    f"failed permanently."
+                raise RuntimeError(
+                    f"Missing checkpoint for chunk {index}."
                 )
 
-                return jsonify({
-                    "error": "Transcription failed",
-                    "chunk": chunk_number,
-                    "total_chunks": len(chunks)
-                }), 500
+            with open(
+                checkpoint_file,
+                "r",
+                encoding="utf-8"
+            ) as text_file:
 
-            texts.append(text)
+                text = text_file.read().strip()
 
-        # --------------------------------------------------
-        # 5. Merge
-        # --------------------------------------------------
+            if text:
+                final_text.append(text)
 
-        print("[5/5] Merging transcript...")
+        merged_text = "\n\n".join(final_text)
 
-        output_file = os.path.join(
+        # ----------------------------------------------------
+        # Save result
+        # ----------------------------------------------------
+
+        result_file = os.path.join(
             work_dir,
             "result.txt"
         )
 
         with open(
-            output_file,
+            result_file,
             "w",
             encoding="utf-8"
-        ) as output:
+        ) as text_file:
 
-            for text in texts:
+            text_file.write(merged_text)
 
-                output.write(text.strip())
-                output.write("\n\n")
+        print(
+            "\n========================================",
+            flush=True
+        )
 
-        print("[DONE] Transcription completed.")
+        print(
+            "[DONE] Transcription completed.",
+            flush=True
+        )
 
-        return send_file(
-            output_file,
+        print(
+            f"[DONE] Job: {job_id}",
+            flush=True
+        )
+
+        print(
+            f"[DONE] Chunks: {total_chunks}",
+            flush=True
+        )
+
+        print(
+            "========================================\n",
+            flush=True
+        )
+
+        # ----------------------------------------------------
+        # Return TXT
+        # ----------------------------------------------------
+
+        response = send_file(
+            result_file,
             as_attachment=True,
-            download_name="result.txt",
+            download_name="transcription.txt",
             mimetype="text/plain; charset=utf-8"
         )
 
-    except subprocess.TimeoutExpired:
+        # Delete after response closes
+        @response.call_on_close
+        def cleanup():
 
-        return jsonify({
-            "error": "Processing timeout"
-        }), 504
+            try:
+                shutil.rmtree(work_dir)
+
+                print(
+                    f"[CLEANUP] Removed {work_dir}",
+                    flush=True
+                )
+
+            except Exception as e:
+
+                print(
+                    f"[CLEANUP] Failed: {e}",
+                    flush=True
+                )
+
+        return response
 
     except Exception as e:
 
-        print(f"[FATAL] {e}")
+        print(
+            "\n[ERROR]",
+            str(e),
+            flush=True
+        )
+
+        # Keep the work directory on failure.
+        # This allows us to inspect checkpoints/logs
+        # before the next test.
 
         return jsonify({
-            "error": "Internal server error",
-            "details": str(e)
+            "error": str(e),
+            "job_id": job_id
         }), 500
-    
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
