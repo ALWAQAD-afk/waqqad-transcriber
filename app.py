@@ -7,9 +7,16 @@ from pathlib import Path
 
 import requests
 from flask import Flask, request, jsonify, send_file
-
+from flask_cors import CORS
 app = Flask(__name__)
-
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": "https://alwaqad-afk.github.io"
+        }
+    }
+)
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 
 # غيّر هذا فقط إذا تغيّر رابط سيرفرك على Render
