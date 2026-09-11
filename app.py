@@ -4,7 +4,7 @@ import json
 import threading
 import mimetypes
 from pathlib import Path
-
+from warraq import handle_warraq_update
 import requests
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -598,7 +598,30 @@ def download_result(job_id):
         mimetype="text/plain"
     )
 
+@app.route(
+    "/telegram/warraq",
+    methods=["POST"]
+)
+def warraq_webhook():
 
+    update = request.get_json(
+        force=True,
+        silent=True
+    )
+
+    if update:
+        try:
+            handle_warraq_update(update)
+
+        except Exception as e:
+            print(
+                f"[WARRAQ ERROR] {e}",
+                flush=True
+            )
+
+    return jsonify({
+        "status": "ok"
+    }), 200
 if __name__ == "__main__":
 
     app.run(
