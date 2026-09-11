@@ -1555,4 +1555,73 @@ def handle_callback(callback):
 
     # ------------------ DELETE ------------------
 
-    if
+    if data.startswith("delete:"):
+
+        try:
+            file_id = int(
+                data.split(":")[1]
+            )
+
+        except Exception:
+            answer_callback(
+                callback_id,
+                "❌ زر غير صالح."
+            )
+            return
+
+        answer_callback(
+            callback_id,
+            "🗑 جارٍ الحذف..."
+        )
+
+        delete_file(
+            chat_id,
+            user_id,
+            file_id
+        )
+
+        return
+
+
+    answer_callback(
+        callback_id
+    )
+
+
+# ============================================================
+# Main entry
+# ============================================================
+
+def handle_warraq_update(update):
+
+    if "callback_query" in update:
+        handle_callback(
+            update["callback_query"]
+        )
+        return
+
+    if "message" in update:
+        handle_message(
+            update["message"]
+        )
+
+
+# ============================================================
+# Startup
+# ============================================================
+
+try:
+    init_db()
+
+    print(
+        "[WARRAQ DATABASE] Ready",
+        flush=True
+    )
+
+except Exception as e:
+
+    print(
+        "[WARRAQ DATABASE INIT ERROR]",
+        repr(e),
+        flush=True
+    )
