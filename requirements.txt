@@ -3,3 +3,4 @@ gunicorn
 requests
 flask-cors
 psycopg[binary]
+psycopg-pool
