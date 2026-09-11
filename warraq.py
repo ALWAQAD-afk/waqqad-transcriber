@@ -339,4 +339,84 @@ def handle_callback(callback):
 
         send_message(
             chat_id,
-            "
+            "❌ تعذر حفظ الملف."
+        )
+        return
+
+
+    result = response.json().get(
+        "result",
+        {}
+    )
+
+    storage_message_id = result.get(
+        "message_id"
+    )
+
+
+    try:
+        file_db_id = add_file_to_db(
+            user_id=user_id,
+            filename="Telegram file",
+            file_size=0,
+            telegram_file_id=None,
+            storage_message_id=storage_message_id,
+            folder=folder_code
+        )
+
+    except Exception as e:
+        print(
+            "[WARRAQ DATABASE ERROR]",
+            repr(e),
+            flush=True
+        )
+
+        send_message(
+            chat_id,
+            "⚠️ حُفظ الملف في Telegram، "
+            "لكن تعذر تسجيله في الفهرس."
+        )
+        return
+
+
+    send_message(
+        chat_id,
+        (
+            "✅ تم حفظ الملف في الوَرّاق.\n\n"
+            f"📁 {folder_name}\n"
+            f"🆔 {file_db_id}"
+        )
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def handle_warraq_update(update):
+    if "callback_query" in update:
+        handle_callback(
+            update["callback_query"]
+        )
+        return
+
+    if "message" in update:
+        handle_message(
+            update["message"]
+        )
+
+
+# إنشاء الجدول عند تحميل التطبيق
+try:
+    init_db()
+    print(
+        "[WARRAQ DATABASE] Ready",
+        flush=True
+    )
+
+except Exception as e:
+    print(
+        "[WARRAQ DATABASE INIT ERROR]",
+        repr(e),
+        flush=True
+    )
