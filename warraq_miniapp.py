@@ -19,6 +19,7 @@ from warraq import (
     copy_message,
     tg,
     MINIAPP_URL,
+    retrieve_saved_file_to_user,
 )
 
 
@@ -840,55 +841,9 @@ def register_warraq_miniapp(app):
             user = _current_user()
             body = request.get_json(silent=True) or {}
 
-            row = get_file(
+            retrieve_saved_file_to_user(
                 user["id"],
                 int(body["file_id"]),
-                saved_only=True,
-            )
-
-            if (
-                not row
-                or not row.get("storage_message_id")
-            ):
-                raise ValueError(
-                    "الملف غير موجود في المخزن"
-                )
-
-            # Clean user-facing copy: no internal owner/hash tags from storage.
-            def _path_for_file():
-                def work(conn):
-                    paths = _folder_paths(conn, user["id"])
-                    return paths.get(
-                        row.get("folder_id"),
-                        "ملفاتي" if row.get("folder_id") is None else "",
-                    )
-                return run_tx(work)
-
-            path = _path_for_file()
-            caption = (
-                "📚 <b>الوَرّاق</b>\n"
-                f"📄 {row.get('file_name') or 'Telegram file'}"
-            )
-            if path:
-                caption += f"\n📁 {path}"
-
-            tg(
-                "copyMessage",
-                {
-                    "chat_id": user["id"],
-                    "from_chat_id": STORAGE_CHAT_ID,
-                    "message_id": row["storage_message_id"],
-                    "caption": caption,
-                    "parse_mode": "HTML",
-                    "reply_markup": {
-                        "inline_keyboard": [[
-                            {
-                                "text": "🏠 الرئيسية",
-                                "callback_data": "panel",
-                            }
-                        ]]
-                    },
-                },
             )
 
             return jsonify({"ok": True})
@@ -898,6 +853,7 @@ def register_warraq_miniapp(app):
 
         except Exception as e:
             return _error(e, 500)
+
 
     @app.route("/warraq/api/files/delete", methods=["POST"])
     def api_delete_file():
