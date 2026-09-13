@@ -360,6 +360,58 @@ def send_ephemeral(chat_id, text, keyboard=None, ttl=8):
     return result
 
 
+
+def _folder_path_for_file(user_id, folder_id):
+    if folder_id is None:
+        return "ملفاتي"
+
+    try:
+        return folder_path(user_id, folder_id)
+    except Exception:
+        return ""
+
+
+def retrieve_saved_file_to_user(user_id, file_id):
+    """
+    Single retrieval path for both Mini App and any remaining legacy callback.
+    Sends a clean copy to the user with a button that creates a fresh control
+    panel below the retrieved file.
+    """
+    row = get_file(user_id, file_id, saved_only=True)
+
+    if not row or not row.get("storage_message_id"):
+        raise ValueError("الملف غير موجود في المخزن")
+
+    path = _folder_path_for_file(user_id, row.get("folder_id"))
+
+    caption = (
+        "📚 <b>الوَرّاق</b>\n"
+        f"📄 {esc(row.get('file_name') or 'Telegram file')}"
+    )
+
+    if path:
+        caption += f"\n📁 {esc(path)}"
+
+    return tg(
+        "copyMessage",
+        {
+            "chat_id": user_id,
+            "from_chat_id": STORAGE_CHAT_ID,
+            "message_id": row["storage_message_id"],
+            "caption": caption,
+            "parse_mode": "HTML",
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {
+                        "text": "🏠 الرئيسية",
+                        "callback_data": "panel",
+                    }
+                ]]
+            },
+        },
+    )
+
+
 def btn(text, data):
     return {"text": text, "callback_data": data}
 
@@ -1011,15 +1063,16 @@ def home_screen(chat_id, user_id, message_id=None, force_new=False):
 
     text = (
         "📚 <b>الوَرّاق</b>\n\n"
-        "أرسل ملفاتك هنا مباشرة، ثم نظّمها من الواجهة.\n"
-        "أو افتح مكتبتك الآن:"
+        "أرسل ملفاتك إلى هذه المحادثة، وستظهر تلقائيًا في <b>الوارد</b>.\n"
+        "ومن الواجهة تستطيع تنظيمها، البحث عنها، نقلها واسترجاعها."
     )
 
     if count:
-        text += f"\n\n📥 لديك <b>{count}</b> ملف/ملفات في الوارد."
+        text += f"\n\n📥 في الوارد الآن: <b>{count}</b>"
 
     keyboard = [
         [webapp_btn("📚 فتح الوَرّاق")],
+        [btn("❓ طريقة الاستخدام", "helpmini")],
     ]
 
     if force_new or not message_id:
@@ -1320,23 +1373,38 @@ def handle_text_message(message):
 
     if command == "/files":
         clear_state(user_id)
-        browse_screen(chat_id, user_id)
+        send_panel(
+            chat_id,
+            user_id,
+            "📁 <b>ملفاتك أصبحت في واجهة الوَرّاق.</b>\n"
+            "افتحها من الزر:",
+            [[webapp_btn("📚 فتح ملفاتي")]],
+        )
         return
 
     if command == "/search":
-        set_state(user_id, "search")
-        send(chat_id, "🔎 اكتب اسم الملف أو جزءًا منه:")
+        clear_state(user_id)
+        send_panel(
+            chat_id,
+            user_id,
+            "🔎 <b>البحث موجود داخل واجهة الوَرّاق</b>\n"
+            "ويدعم الاسم والنوع والمسار.",
+            [[webapp_btn("🔎 فتح البحث")]],
+        )
         return
 
     if command == "/help":
-        send(
+        send_panel(
             chat_id,
-            "📚 <b>طريقة استخدام الوَرّاق</b>\n\n"
-            "• أرسل ملفًا ثم اختر مكان حفظه.\n"
-            "• /files لتصفح مكتبتك.\n"
-            "• /search للبحث باسم الملف.\n"
-            "• تستطيع إنشاء مجلدات داخل مجلدات.\n"
-            "• يمكنك إرسال عدة ملفات ثم تنظيمها معًا.",
+            user_id,
+            "❓ <b>طريقة استخدام الوَرّاق</b>\n\n"
+            "1) أرسل أي ملف إلى البوت.\n"
+            "2) افتح الوَرّاق، وستجده في <b>الوارد</b>.\n"
+            "3) حدّد ملفًا أو عدة ملفات واحفظها في المجلد الذي تريد.\n"
+            "4) استخدم البحث والفلاتر للوصول السريع.\n"
+            "5) من قائمة الملف يمكنك نقله أو استرجاعه.\n\n"
+            "💡 يمكنك إنشاء مجلدات داخل مجلدات بلا مشكلة.",
+            [[webapp_btn("📚 فتح الوَرّاق")]],
         )
         return
 
@@ -1484,6 +1552,24 @@ def handle_callback(q):
         home_screen(chat_id, user_id, force_new=True)
         return
 
+    if data == "helpmini":
+        edit(
+            chat_id,
+            message_id,
+            "❓ <b>طريقة الاستخدام</b>\n\n"
+            "• أرسل الملفات هنا مباشرة.\n"
+            "• افتح الوَرّاق وستجدها في <b>الوارد</b>.\n"
+            "• حدّد ملفًا أو أكثر ثم اختر المجلد.\n"
+            "• يمكنك إنشاء مجلدات متداخلة.\n"
+            "• البحث يدعم الاسم وPDF وWord والصور والصوت والفيديو والأرشيف.\n"
+            "• من الملف تستطيع النقل أو الاسترجاع.",
+            [
+                [webapp_btn("📚 فتح الوَرّاق")],
+                [btn("↩️ رجوع", "home")],
+            ],
+        )
+        return
+
     if data == "search":
         set_state(user_id, "search")
 
@@ -1526,28 +1612,19 @@ def handle_callback(q):
 
     if data.startswith("get:"):
         file_id = int(data.split(":")[1])
-        row = get_file(
-            user_id,
-            file_id,
-            saved_only=True,
-        )
-
-        if not row:
-            send(chat_id, "❌ الملف غير موجود.")
-            return
 
         try:
-            copy_message(
-                chat_id,
-                STORAGE_CHAT_ID,
-                row["storage_message_id"],
+            retrieve_saved_file_to_user(
+                user_id,
+                file_id,
             )
 
         except Exception:
             log.exception("Retrieve failed")
-            send(
+            send_ephemeral(
                 chat_id,
                 "❌ تعذر استرجاع الملف من المخزن.",
+                ttl=8,
             )
 
         return
