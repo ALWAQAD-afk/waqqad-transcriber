@@ -10,7 +10,7 @@ from psycopg_pool import ConnectionPool
 
 
 # ============================================================
-# Alwarraq v1.1-fast
+# Alwarraq RC3.2 — Mini App polish + cache support
 # Fast Telegram file library
 # ============================================================
 
