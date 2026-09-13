@@ -18,6 +18,7 @@ from warraq import (
     get_file,
     copy_message,
     tg,
+    MINIAPP_URL,
 )
 
 
@@ -853,10 +854,41 @@ def register_warraq_miniapp(app):
                     "الملف غير موجود في المخزن"
                 )
 
-            copy_message(
-                user["id"],
-                STORAGE_CHAT_ID,
-                row["storage_message_id"],
+            # Clean user-facing copy: no internal owner/hash tags from storage.
+            def _path_for_file():
+                def work(conn):
+                    paths = _folder_paths(conn, user["id"])
+                    return paths.get(
+                        row.get("folder_id"),
+                        "ملفاتي" if row.get("folder_id") is None else "",
+                    )
+                return run_tx(work)
+
+            path = _path_for_file()
+            caption = (
+                "📚 <b>الوَرّاق</b>\n"
+                f"📄 {row.get('file_name') or 'Telegram file'}"
+            )
+            if path:
+                caption += f"\n📁 {path}"
+
+            tg(
+                "copyMessage",
+                {
+                    "chat_id": user["id"],
+                    "from_chat_id": STORAGE_CHAT_ID,
+                    "message_id": row["storage_message_id"],
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                    "reply_markup": {
+                        "inline_keyboard": [[
+                            {
+                                "text": "📚 فتح الوَرّاق",
+                                "web_app": {"url": MINIAPP_URL},
+                            }
+                        ]]
+                    },
+                },
             )
 
             return jsonify({"ok": True})
