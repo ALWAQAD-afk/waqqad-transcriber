@@ -6,49 +6,1056 @@
 <title>الوَرّاق</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-:root{--bg:var(--tg-theme-bg-color,#0f1115);--card:var(--tg-theme-secondary-bg-color,#181b21);--text:var(--tg-theme-text-color,#f5f7fb);--hint:var(--tg-theme-hint-color,#9298a3);--link:var(--tg-theme-link-color,#58a6ff);--button:var(--tg-theme-button-color,#2481cc);--button-text:var(--tg-theme-button-text-color,#fff);--line:rgba(255,255,255,.08)}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Tahoma,Arial,sans-serif;padding-bottom:88px;min-height:100vh}.app{max-width:760px;margin:auto;padding:14px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}.brand{font-size:27px;font-weight:900}.sub,.meta{color:var(--hint);font-size:13px}.searchbox{width:100%;border:0;border-radius:16px;background:var(--card);color:var(--text);padding:14px 16px;outline:none;margin-bottom:14px}.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}.stat,.folder,.file{background:var(--card);border-radius:18px}.stat{padding:15px}.stat b{font-size:25px;display:block}.section{display:flex;justify-content:space-between;align-items:center;margin:19px 2px 10px}.section h2{font-size:17px;margin:0}.ghost{border:0;background:transparent;color:var(--link)}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.folder{border:0;color:var(--text);padding:16px;text-align:right}.ico{font-size:28px;display:block;margin-bottom:8px}.name{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.list{display:flex;flex-direction:column;gap:8px}.file{display:flex;align-items:center;gap:10px;padding:12px}.fileico{font-size:25px;width:34px;text-align:center}.filemain{min-width:0;flex:1}.filename{font-weight:750;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.breadcrumbs,.filters{display:flex;gap:7px;overflow:auto;margin-bottom:12px}.crumb,.chip{border:0;border-radius:999px;background:var(--card);color:var(--text);padding:9px 12px;white-space:nowrap}.chip.active{background:var(--button);color:var(--button-text)}.empty{text-align:center;color:var(--hint);padding:42px 10px}.fab{position:fixed;left:18px;bottom:95px;width:56px;height:56px;border-radius:18px;border:0;background:var(--button);color:var(--button-text);font-size:28px}.bar{position:fixed;bottom:0;left:0;right:0;background:var(--bg);border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(4,1fr);padding:8px}.nav{border:0;background:transparent;color:var(--hint);padding:7px 2px}.nav span{display:block;font-size:22px}.nav.active{color:var(--link)}.sheetwrap{position:fixed;inset:0;background:#0008;display:none;align-items:flex-end;z-index:20}.sheetwrap.show{display:flex}.sheet{width:100%;max-height:78vh;overflow:auto;background:var(--bg);border-radius:24px 24px 0 0;padding:18px 16px 24px}.action{width:100%;border:0;background:var(--card);color:var(--text);border-radius:14px;padding:13px;margin:5px 0;text-align:right}.primary{background:var(--button);color:var(--button-text);text-align:center;font-weight:800}.selectbar{position:fixed;left:14px;right:14px;bottom:88px;background:var(--card);padding:10px;border-radius:17px;display:none;gap:8px;z-index:15}.selectbar.show{display:flex}.selectbar button{flex:1;border:0;border-radius:12px;padding:11px;background:var(--button);color:var(--button-text)}.toast{position:fixed;top:16px;left:50%;transform:translateX(-50%) translateY(-80px);background:#222;color:#fff;padding:10px 14px;border-radius:12px;z-index:99;transition:.25s}.toast.show{transform:translateX(-50%) translateY(0)}
+:root{
+  --bg:var(--tg-theme-bg-color,#0f1115);
+  --card:var(--tg-theme-secondary-bg-color,#181b21);
+  --text:var(--tg-theme-text-color,#f5f7fb);
+  --hint:var(--tg-theme-hint-color,#9298a3);
+  --link:var(--tg-theme-link-color,#58a6ff);
+  --button:var(--tg-theme-button-color,#2481cc);
+  --button-text:var(--tg-theme-button-text-color,#fff);
+  --danger:#ef5350;
+  --line:rgba(127,127,127,.18);
+}
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font-family:system-ui,-apple-system,"Segoe UI",Tahoma,Arial,sans-serif;
+  min-height:100vh;padding-bottom:90px;
+}
+button,input{font:inherit}
+button{cursor:pointer}
+.app{max-width:780px;margin:auto;padding:14px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px}
+.brand{font-size:26px;font-weight:900}
+.sub,.meta{color:var(--hint);font-size:13px}
+.searchbox{
+  width:100%;border:0;border-radius:16px;background:var(--card);
+  color:var(--text);padding:14px 16px;outline:none;margin-bottom:14px;
+}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stat,.folder,.file{background:var(--card);border-radius:18px}
+.stat{padding:15px}
+.stat b{font-size:25px;display:block}
+.section{display:flex;align-items:center;justify-content:space-between;margin:19px 2px 10px}
+.section h2{font-size:17px;margin:0}
+.ghost{border:0;background:transparent;color:var(--link);padding:7px}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.folder{
+  position:relative;border:0;color:var(--text);padding:16px;text-align:right;min-height:98px
+}
+.folder .ico{font-size:29px;display:block;margin-bottom:8px}
+.folder .name{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-left:26px}
+.folderdots{
+  position:absolute;left:8px;top:7px;border:0;background:transparent;
+  color:var(--hint);font-size:22px;padding:5px 8px;border-radius:10px
+}
+.list{display:flex;flex-direction:column;gap:8px}
+.file{display:flex;align-items:center;gap:10px;padding:12px}
+.file.selected{outline:2px solid var(--button)}
+.file input{width:20px;height:20px;flex:none}
+.fileico{font-size:25px;width:34px;text-align:center}
+.filemain{flex:1;min-width:0}
+.filename{font-weight:750;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta{margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dots{border:0;background:transparent;color:var(--hint);font-size:23px;padding:5px 8px}
+.breadcrumbs,.filters{display:flex;gap:7px;overflow:auto;margin-bottom:12px;padding-bottom:2px}
+.crumb,.chip{
+  border:0;border-radius:999px;background:var(--card);color:var(--text);
+  padding:9px 12px;white-space:nowrap
+}
+.chip.active{background:var(--button);color:var(--button-text)}
+.empty{text-align:center;color:var(--hint);padding:42px 10px;line-height:1.7}
+.fab{
+  position:fixed;left:18px;bottom:96px;width:58px;height:58px;border-radius:19px;
+  border:0;background:var(--button);color:var(--button-text);font-size:30px;
+  box-shadow:0 9px 30px #0005;z-index:10
+}
+.bar{
+  position:fixed;left:0;right:0;bottom:0;background:color-mix(in srgb,var(--bg) 92%,transparent);
+  backdrop-filter:blur(14px);border-top:1px solid var(--line);
+  display:grid;grid-template-columns:repeat(4,1fr);
+  padding:8px 8px calc(8px + env(safe-area-inset-bottom));z-index:12
+}
+.nav{border:0;background:transparent;color:var(--hint);padding:7px 2px;font-size:12px}
+.nav span{display:block;font-size:22px;margin-bottom:2px}
+.nav.active{color:var(--link)}
+.sheetwrap{
+  position:fixed;inset:0;background:#0009;display:none;align-items:flex-end;
+  z-index:30
+}
+.sheetwrap.show{display:flex}
+.sheet{
+  width:100%;max-height:82vh;overflow:auto;background:var(--bg);
+  border-radius:24px 24px 0 0;padding:18px 16px calc(24px + env(safe-area-inset-bottom))
+}
+.sheet h3{margin:0 0 12px}
+.action{
+  width:100%;border:0;background:var(--card);color:var(--text);
+  border-radius:14px;padding:14px;margin:5px 0;text-align:right
+}
+.action.primary{background:var(--button);color:var(--button-text);font-weight:800;text-align:center}
+.action.danger{color:#ff7373}
+.selectbar{
+  position:fixed;left:14px;right:14px;bottom:88px;background:var(--card);
+  border:1px solid var(--line);padding:10px;border-radius:17px;display:none;
+  gap:8px;z-index:20;box-shadow:0 8px 28px #0006
+}
+.selectbar.show{display:flex}
+.selectbar button{
+  flex:1;border:0;border-radius:12px;padding:11px;
+  background:var(--button);color:var(--button-text);font-weight:750
+}
+.toast{
+  position:fixed;top:16px;left:50%;max-width:90%;
+  transform:translateX(-50%) translateY(-80px);
+  background:#222;color:#fff;padding:10px 14px;border-radius:12px;
+  z-index:99;transition:.22s;text-align:center
+}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.loading{
+  opacity:.55;pointer-events:none
+}
+.toolbar{display:flex;gap:8px}
+.tool{
+  border:0;background:var(--card);color:var(--text);
+  border-radius:12px;padding:9px 11px
+}
+.destpath{color:var(--hint);font-size:13px;margin-bottom:10px}
 </style>
 </head>
 <body>
-<div class="toast" id="toast"></div><div class="app" id="app"></div>
-<button class="fab" id="fab" onclick="newFolder()" style="display:none">＋</button>
-<div class="selectbar" id="selectbar"><button onclick="chooseDestination()">نقل / حفظ في…</button><button onclick="clearSelection()">إلغاء</button></div>
+
+<div id="toast" class="toast"></div>
+<div id="app" class="app"></div>
+
+<button id="fab" class="fab" onclick="openAddMenu()" style="display:none">＋</button>
+
+<div id="selectbar" class="selectbar">
+  <button onclick="openDestination()">📁 نقل / حفظ</button>
+  <button onclick="clearSelection()">إلغاء</button>
+</div>
+
 <nav class="bar">
-<button class="nav active" data-tab="home" onclick="goHome()"><span>🏠</span>الرئيسية</button>
-<button class="nav" data-tab="inbox" onclick="goInbox()"><span>📥</span>الوارد</button>
-<button class="nav" data-tab="files" onclick="openFolder(null)"><span>📁</span>الملفات</button>
-<button class="nav" data-tab="search" onclick="goSearch()"><span>🔎</span>البحث</button>
+  <button class="nav active" data-tab="home" onclick="goHome()"><span>🏠</span>الرئيسية</button>
+  <button class="nav" data-tab="inbox" onclick="goInbox()"><span>📥</span>الوارد</button>
+  <button class="nav" data-tab="files" onclick="openFolder(null)"><span>📁</span>الملفات</button>
+  <button class="nav" data-tab="search" onclick="goSearch()"><span>🔎</span>البحث</button>
 </nav>
-<div class="sheetwrap" id="sheetwrap" onclick="if(event.target.id==='sheetwrap')closeSheet()"><div class="sheet" id="sheet"></div></div>
+
+<div id="sheetwrap" class="sheetwrap" onclick="sheetBackdrop(event)">
+  <div id="sheet" class="sheet"></div>
+</div>
+
 <script>
-const tg=window.Telegram.WebApp;tg.ready();tg.expand();
-const API="/warraq/api",initData=tg.initData||"";let state={tab:"home",folderId:null,selected:new Set(),selectionMode:null,searchKind:"all"};
-const H=()=>({"Content-Type":"application/json","X-Telegram-Init-Data":initData});
-async function api(p,o={}){let r=await fetch(API+p,{...o,headers:H()}),d={};try{d=await r.json()}catch(_){}if(!r.ok||d.ok===false)throw new Error(d.error||"حدث خطأ");return d}
-function esc(s=""){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]))}
-function toast(m){let e=document.getElementById("toast");e.textContent=m;e.classList.add("show");setTimeout(()=>e.classList.remove("show"),2000)}
-function setTab(n){state.tab=n;document.querySelectorAll(".nav").forEach(x=>x.classList.toggle("active",x.dataset.tab===n))}
-function icon(k){return({image:"🖼️",audio:"🎧",video:"🎬",pdf:"📕",text:"📝",archive:"📦",document:"📄"})[k]||"📄"}
-function card(f,s=false){let ch=state.selected.has(f.id)?"checked":"";return `<div class="file" onclick="${s?`toggle(${f.id})`:`menu(${f.id},${JSON.stringify(f.name)},${JSON.stringify(f.path||"")})`}">${s?`<input type=checkbox ${ch} onclick="event.stopPropagation();toggle(${f.id})">`:""}<div class=fileico>${icon(f.kind)}</div><div class=filemain><div class=filename>${esc(f.name)}</div><div class=meta>${esc(f.size_human)}${f.path?` · 📁 ${esc(f.path)}`:""}</div></div></div>`}
-function sync(){document.getElementById("selectbar").classList.toggle("show",state.selected.size>0)}
-async function goHome(){setTab("home");state.selected.clear();sync();fab.style.display="none";app.innerHTML='<div class=empty>جاري التحميل…</div>';try{let d=await api("/bootstrap");app.innerHTML=`<div class=top><div><div class=brand>الوَرّاق 📚</div><div class=sub>مكتبتك داخل تيليجرام</div></div></div><input class=searchbox placeholder="ابحث في مكتبتك…" onclick="goSearch()"><div class=stats><div class=stat onclick="goInbox()"><b>${d.inbox_count}</b><span>في الوارد</span></div><div class=stat onclick="openFolder(null)"><b>${d.total_files}</b><span>ملف محفوظ</span></div></div><div class=section><h2>المجلدات</h2><button class=ghost onclick="openFolder(null)">عرض الكل</button></div><div class=grid>${d.folders.slice(0,6).map(f=>`<button class=folder onclick="openFolder(${f.id})"><span class=ico>${f.icon||"📁"}</span><div class=name>${esc(f.name)}</div></button>`).join("")}</div><div class=section><h2>الأخيرة</h2></div><div class=list>${d.recent.length?d.recent.map(f=>card(f)).join(""):'<div class=empty>لا توجد ملفات بعد.</div>'}</div>`}catch(e){app.innerHTML=`<div class=empty><h2>افتح الوَرّاق من داخل Telegram</h2><p>${esc(e.message)}</p></div>`}}
-async function openFolder(id){setTab("files");state.folderId=id;state.selectionMode="saved";state.selected.clear();sync();fab.style.display="block";app.innerHTML='<div class=empty>جاري الفتح…</div>';try{let d=await api("/folder?id="+(id??"root")),c=[{id:null,name:"ملفاتي"},...(d.breadcrumb||[])];app.innerHTML=`<div class=top><div><div class=brand>📁 الملفات</div></div></div><div class=breadcrumbs>${c.map(x=>`<button class=crumb onclick="openFolder(${x.id===null?"null":x.id})">${esc(x.name)}</button>`).join("")}</div><div class=grid>${d.children.map(f=>`<button class=folder onclick="openFolder(${f.id})"><span class=ico>${f.icon||"📁"}</span><div class=name>${esc(f.name)}</div></button>`).join("")}</div><div class=section><h2>الملفات</h2></div><div class=list>${d.files.length?d.files.map(f=>card(f)).join(""):'<div class=empty>المجلد فارغ.</div>'}</div>`}catch(e){toast(e.message)}}
-async function goInbox(){setTab("inbox");state.selectionMode="pending";state.selected.clear();sync();fab.style.display="none";try{let d=await api("/inbox");app.innerHTML=`<div class=top><div><div class=brand>📥 الوارد</div><div class=sub>حدد عدة ملفات وانقلها دفعة واحدة</div></div></div><div class=list>${d.files.length?d.files.map(f=>card(f,true)).join(""):'<div class=empty>الوارد فارغ ✨</div>'}</div>`}catch(e){toast(e.message)}}
-function toggle(id){state.selected.has(id)?state.selected.delete(id):state.selected.add(id);sync();goInboxKeep()}
-async function goInboxKeep(){let d=await api("/inbox");app.innerHTML=`<div class=top><div><div class=brand>📥 الوارد</div><div class=sub>تم تحديد ${state.selected.size}</div></div></div><div class=list>${d.files.map(f=>card(f,true)).join("")}</div>`}
-function clearSelection(){state.selected.clear();sync();state.tab==="inbox"?goInbox():openFolder(state.folderId)}
-async function goSearch(){setTab("search");fab.style.display="none";app.innerHTML=`<div class=top><div><div class=brand>🔎 البحث</div></div></div><input id=q class=searchbox placeholder="اسم الملف…" oninput="runSearch()"><div class=filters>${[["all","الكل"],["pdf","PDF"],["image","صور"],["text","نصوص"],["audio","صوت"],["video","فيديو"],["archive","أرشيف"]].map(([k,t])=>`<button class="chip ${k==="all"?"active":""}" onclick="kind('${k}',this)">${t}</button>`).join("")}</div><div class=list id=results><div class=empty>ابحث بالاسم أو النوع.</div></div>`}
-function kind(k,e){state.searchKind=k;document.querySelectorAll(".chip").forEach(x=>x.classList.remove("active"));e.classList.add("active");runSearch()}
-let timer;function runSearch(){clearTimeout(timer);timer=setTimeout(async()=>{let q=document.getElementById("q")?.value||"",d=await api(`/search?q=${encodeURIComponent(q)}&kind=${state.searchKind}`);results.innerHTML=d.files.length?d.files.map(f=>card(f)).join(""):'<div class=empty>لا نتائج.</div>'},200)}
-function openSheet(h){sheet.innerHTML=h;sheetwrap.classList.add("show")}function closeSheet(){sheetwrap.classList.remove("show")}
-function menu(id,n,p){openSheet(`<h3>${esc(n)}</h3><div class=sub>${p?`📁 ${esc(p)}`:""}</div><button class=action onclick="retrieve(${id})">📤 إرسال إلى المحادثة</button><button class=action onclick="moveOne(${id})">📁 نقل…</button><button class=action onclick="closeSheet()">إلغاء</button>`)}
-async function retrieve(id){await api("/files/retrieve",{method:"POST",body:JSON.stringify({file_id:id})});closeSheet();toast("أرسلته لك ✅")}
-function moveOne(id){closeSheet();state.selected=new Set([id]);state.selectionMode="saved";sync();chooseDestination()}
-async function newFolder(){let n=prompt("اسم المجلد الجديد:");if(!n)return;try{await api("/folders",{method:"POST",body:JSON.stringify({name:n,parent_id:state.folderId})});toast("تم إنشاء المجلد ✅");openFolder(state.folderId)}catch(e){toast(e.message)}}
-async function chooseDestination(){let d=await api("/folder?id=root");openSheet(`<h3>📁 اختر المجلد</h3><button class="action primary" onclick="finishDest(null)">ملفاتي</button>${d.children.map(f=>`<button class=action onclick="dest(${f.id},${JSON.stringify(f.name)})">${f.icon||"📁"} ${esc(f.name)}</button>`).join("")}<button class=action onclick="closeSheet()">إلغاء</button>`)}
-async function dest(id,n){let d=await api("/folder?id="+id);openSheet(`<h3>📁 ${esc(n)}</h3><button class="action primary" onclick="finishDest(${id})">✅ اختيار هذا المجلد</button>${d.children.map(f=>`<button class=action onclick="dest(${f.id},${JSON.stringify(f.name)})">${f.icon||"📁"} ${esc(f.name)}</button>`).join("")}<button class=action onclick="chooseDestination()">↩️ الجذر</button>`)}
-async function finishDest(fid){let ids=[...state.selected];try{if(state.selectionMode==="pending"){let d=await api("/pending/save",{method:"POST",body:JSON.stringify({file_ids:ids,folder_id:fid})});toast(d.failed?.length?`حُفظ ${d.saved.length} وفشل ${d.failed.length}`:`حُفظ ${d.saved.length} ملف ✅`)}else{let d=await api("/files/move",{method:"POST",body:JSON.stringify({file_ids:ids,folder_id:fid})});toast(`نُقل ${d.moved} ملف ✅`)}closeSheet();clearSelection()}catch(e){toast(e.message)}}
+const tg = window.Telegram.WebApp;
+tg.ready();
+tg.expand();
+
+const API = "/warraq/api";
+const BOT_LINK = "https://t.me/warraq97_bot";
+const initData = tg.initData || "";
+
+const state = {
+  tab: "home",
+  folderId: null,
+  folderTree: [],
+  selected: new Set(),
+  selectionMode: null, // pending | saved
+  selectingSaved: false,
+  currentFiles: [],
+  currentBreadcrumb: [],
+  searchKind: "all",
+  busy: false,
+};
+
+function esc(s=""){
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
+  }[c]));
+}
+
+function headers(){
+  return {
+    "Content-Type":"application/json",
+    "X-Telegram-Init-Data": initData
+  };
+}
+
+async function api(path, options={}){
+  const r = await fetch(API + path, {
+    ...options,
+    headers: {
+      ...headers(),
+      ...(options.headers || {})
+    }
+  });
+
+  let data = {};
+  try { data = await r.json(); } catch (_) {}
+
+  if (!r.ok || data.ok === false){
+    throw new Error(data.error || "حدث خطأ");
+  }
+
+  return data;
+}
+
+function toast(message){
+  const el = document.getElementById("toast");
+  el.textContent = message;
+  el.classList.add("show");
+  clearTimeout(window.__toastTimer);
+  window.__toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
+}
+
+function setTab(name){
+  state.tab = name;
+  document.querySelectorAll(".nav").forEach(el => {
+    el.classList.toggle("active", el.dataset.tab === name);
+  });
+}
+
+function setBusy(value){
+  state.busy = value;
+  document.body.classList.toggle("loading", value);
+}
+
+function kindIcon(kind){
+  return ({
+    image:"🖼️",
+    audio:"🎧",
+    video:"🎬",
+    pdf:"📕",
+    word:"🟦",
+    text:"📝",
+    archive:"📦",
+    document:"📄"
+  })[kind] || "📄";
+}
+
+function rootFolders(){
+  return state.folderTree.filter(f => f.parent_id == null);
+}
+
+function childrenOf(parentId){
+  return state.folderTree.filter(f =>
+    (parentId == null && f.parent_id == null) ||
+    Number(f.parent_id) === Number(parentId)
+  );
+}
+
+function folderById(id){
+  return state.folderTree.find(f => Number(f.id) === Number(id));
+}
+
+function folderPathIds(id){
+  if (id == null) return [];
+
+  const out = [];
+  let current = folderById(id);
+  const guard = new Set();
+
+  while (current && !guard.has(current.id)){
+    guard.add(current.id);
+    out.unshift(current);
+    current = current.parent_id == null
+      ? null
+      : folderById(current.parent_id);
+  }
+
+  return out;
+}
+
+async function loadTree(force=false){
+  if (state.folderTree.length && !force) return state.folderTree;
+  const d = await api("/tree");
+  state.folderTree = d.folders || [];
+  return state.folderTree;
+}
+
+function fileCard(file, selectable=false){
+  const selected = state.selected.has(file.id);
+  const selectMode = selectable || (state.selectionMode === "saved" && state.selectingSaved);
+
+  return `
+    <div class="file ${selected ? "selected" : ""}"
+         onclick="${selectMode ? `toggleFile(${file.id})` : `openFileMenu(${file.id})`}">
+      ${selectMode
+        ? `<input type="checkbox" ${selected ? "checked" : ""}
+                  onclick="event.stopPropagation();toggleFile(${file.id})">`
+        : ""
+      }
+      <div class="fileico">${kindIcon(file.kind)}</div>
+      <div class="filemain">
+        <div class="filename">${esc(file.name)}</div>
+        <div class="meta">
+          ${esc(file.size_human)}
+          ${file.path ? ` · 📁 ${esc(file.path)}` : ""}
+        </div>
+      </div>
+      ${selectMode
+        ? ""
+        : `<button class="dots" onclick="event.stopPropagation();openFileMenu(${file.id})">⋮</button>`
+      }
+    </div>
+  `;
+}
+
+function folderCard(folder){
+  return `
+    <button class="folder" onclick="openFolder(${folder.id})">
+      <button class="folderdots"
+              onclick="event.stopPropagation();openFolderMenu(${folder.id})">⋮</button>
+      <span class="ico">${folder.icon || "📁"}</span>
+      <div class="name">${esc(folder.name)}</div>
+    </button>
+  `;
+}
+
+function syncSelectionBar(){
+  document.getElementById("selectbar")
+    .classList.toggle("show", state.selected.size > 0);
+}
+
+function clearSelection(){
+  state.selected.clear();
+  state.selectingSaved = false;
+  syncSelectionBar();
+
+  if (state.tab === "inbox") {
+    renderInboxFromCache();
+  } else if (state.tab === "files") {
+    renderCurrentFolder();
+  }
+}
+
+function toggleFile(id){
+  if (state.selected.has(id)){
+    state.selected.delete(id);
+  } else {
+    state.selected.add(id);
+  }
+
+  syncSelectionBar();
+
+  if (state.tab === "inbox"){
+    renderInboxFromCache();
+  } else {
+    renderCurrentFolder();
+  }
+}
+
+function openSheet(html){
+  document.getElementById("sheet").innerHTML = html;
+  document.getElementById("sheetwrap").classList.add("show");
+}
+
+function closeSheet(){
+  document.getElementById("sheetwrap").classList.remove("show");
+}
+
+function sheetBackdrop(e){
+  if (e.target.id === "sheetwrap") closeSheet();
+}
+
+
+// ============================================================
+// Home
+// ============================================================
+
+async function goHome(){
+  setTab("home");
+  state.selected.clear();
+  state.selectionMode = null;
+  state.selectingSaved = false;
+  syncSelectionBar();
+
+  document.getElementById("fab").style.display = "none";
+  document.getElementById("app").innerHTML =
+    `<div class="empty">جاري التحميل…</div>`;
+
+  try {
+    const d = await api("/bootstrap");
+    state.folderTree = d.folders || [];
+
+    const roots = rootFolders();
+
+    document.getElementById("app").innerHTML = `
+      <div class="top">
+        <div>
+          <div class="brand">الوَرّاق 📚</div>
+          <div class="sub">مكتبتك داخل تيليجرام</div>
+        </div>
+      </div>
+
+      <input class="searchbox"
+             placeholder="ابحث في مكتبتك…"
+             onclick="goSearch()"
+             readonly>
+
+      <div class="stats">
+        <div class="stat" onclick="goInbox()">
+          <b>${d.inbox_count}</b>
+          <span>في الوارد</span>
+        </div>
+
+        <div class="stat" onclick="openFolder(null)">
+          <b>${d.total_files}</b>
+          <span>ملف محفوظ</span>
+        </div>
+      </div>
+
+      <div class="section">
+        <h2>المجلدات</h2>
+        <button class="ghost" onclick="openFolder(null)">عرض الكل</button>
+      </div>
+
+      <div class="grid">
+        ${roots.slice(0,6).map(folderCard).join("")}
+      </div>
+
+      <div class="section"><h2>الأخيرة</h2></div>
+
+      <div class="list">
+        ${d.recent.length
+          ? d.recent.map(f => fileCard(f)).join("")
+          : `<div class="empty">لا توجد ملفات محفوظة بعد.</div>`
+        }
+      </div>
+    `;
+
+  } catch (e){
+    document.getElementById("app").innerHTML = `
+      <div class="empty">
+        <div style="font-size:48px">📚</div>
+        <h2>افتح الوَرّاق من داخل Telegram</h2>
+        <p>${esc(e.message)}</p>
+      </div>
+    `;
+  }
+}
+
+
+// ============================================================
+// Folder browser
+// ============================================================
+
+async function openFolder(id){
+  setTab("files");
+  state.folderId = id;
+  state.selectionMode = "saved";
+  state.selected.clear();
+  state.selectingSaved = false;
+  syncSelectionBar();
+
+  document.getElementById("fab").style.display = "block";
+  document.getElementById("app").innerHTML =
+    `<div class="empty">جاري فتح المجلد…</div>`;
+
+  try {
+    await loadTree();
+
+    const d = await api("/folder?id=" + (id ?? "root"));
+    state.currentFiles = d.files || [];
+    state.currentBreadcrumb = d.breadcrumb || [];
+
+    renderCurrentFolder();
+
+  } catch (e){
+    toast(e.message);
+  }
+}
+
+function renderCurrentFolder(){
+  const id = state.folderId;
+  const children = childrenOf(id);
+  const crumbs = [
+    {id:null, name:"ملفاتي"},
+    ...state.currentBreadcrumb
+  ];
+
+  document.getElementById("app").innerHTML = `
+    <div class="top">
+      <div>
+        <div class="brand">📁 الملفات</div>
+        <div class="sub">
+          ${state.currentFiles.length} ملف
+          ${state.selectingSaved ? ` · وضع التحديد` : ""}
+        </div>
+      </div>
+
+      <div class="toolbar">
+        ${state.currentFiles.length
+          ? `<button class="tool" onclick="toggleSavedSelection()">
+               ${state.selectingSaved ? "إلغاء التحديد" : "تحديد"}
+             </button>`
+          : ""
+        }
+      </div>
+    </div>
+
+    <div class="breadcrumbs">
+      ${crumbs.map(c => `
+        <button class="crumb"
+                onclick="openFolder(${c.id == null ? "null" : c.id})">
+          ${esc(c.name)}
+        </button>
+      `).join("")}
+    </div>
+
+    <div class="grid">
+      ${children.map(folderCard).join("")}
+    </div>
+
+    <div class="section"><h2>الملفات</h2></div>
+
+    <div class="list">
+      ${state.currentFiles.length
+        ? state.currentFiles.map(f => fileCard(f)).join("")
+        : `<div class="empty">
+             ${children.length ? "لا توجد ملفات في هذا المجلد." : "المجلد فارغ."}
+           </div>`
+      }
+    </div>
+  `;
+}
+
+function toggleSavedSelection(){
+  state.selectingSaved = !state.selectingSaved;
+  state.selected.clear();
+  syncSelectionBar();
+  renderCurrentFolder();
+}
+
+
+// ============================================================
+// Inbox
+// ============================================================
+
+async function goInbox(){
+  setTab("inbox");
+  state.selectionMode = "pending";
+  state.selected.clear();
+  state.selectingSaved = false;
+  syncSelectionBar();
+
+  document.getElementById("fab").style.display = "block";
+  document.getElementById("app").innerHTML =
+    `<div class="empty">جاري تحميل الوارد…</div>`;
+
+  try {
+    const d = await api("/inbox");
+    state.currentFiles = d.files || [];
+    renderInboxFromCache();
+
+  } catch (e){
+    toast(e.message);
+  }
+}
+
+function renderInboxFromCache(){
+  document.getElementById("app").innerHTML = `
+    <div class="top">
+      <div>
+        <div class="brand">📥 الوارد</div>
+        <div class="sub">
+          اضغط على ملف أو أكثر لتحديده ثم احفظه في أي مجلد.
+        </div>
+      </div>
+    </div>
+
+    <div class="list">
+      ${state.currentFiles.length
+        ? state.currentFiles.map(f => fileCard(f, true)).join("")
+        : `<div class="empty">
+             الوارد فارغ ✨<br>
+             اضغط + لإضافة ملف جديد.
+           </div>`
+      }
+    </div>
+  `;
+}
+
+
+// ============================================================
+// Search
+// ============================================================
+
+async function goSearch(){
+  setTab("search");
+  state.selected.clear();
+  state.selectionMode = null;
+  state.selectingSaved = false;
+  syncSelectionBar();
+
+  document.getElementById("fab").style.display = "block";
+
+  document.getElementById("app").innerHTML = `
+    <div class="top">
+      <div>
+        <div class="brand">🔎 البحث</div>
+        <div class="sub">بالاسم أو النوع</div>
+      </div>
+    </div>
+
+    <input id="searchInput"
+           class="searchbox"
+           placeholder="اسم الملف أو جزء منه…"
+           oninput="scheduleSearch()">
+
+    <div class="filters">
+      ${[
+        ["all","الكل"],
+        ["pdf","PDF"],
+        ["word","Word"],
+        ["image","صور"],
+        ["text","نصوص"],
+        ["audio","صوت"],
+        ["video","فيديو"],
+        ["archive","أرشيف"]
+      ].map(([k,t]) => `
+        <button class="chip ${k === state.searchKind ? "active" : ""}"
+                onclick="setKind('${k}',this)">
+          ${t}
+        </button>
+      `).join("")}
+    </div>
+
+    <div id="searchResults" class="list">
+      <div class="empty">اكتب للبحث أو اختر نوعًا.</div>
+    </div>
+  `;
+
+  if (state.searchKind !== "all") runSearch();
+}
+
+function setKind(kind, element){
+  state.searchKind = kind;
+
+  document.querySelectorAll(".chip").forEach(el =>
+    el.classList.remove("active")
+  );
+
+  element.classList.add("active");
+  runSearch();
+}
+
+let searchTimer;
+
+function scheduleSearch(){
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(runSearch, 220);
+}
+
+async function runSearch(){
+  const q = document.getElementById("searchInput")?.value || "";
+
+  try {
+    const d = await api(
+      `/search?q=${encodeURIComponent(q)}&kind=${encodeURIComponent(state.searchKind)}`
+    );
+
+    document.getElementById("searchResults").innerHTML =
+      d.files.length
+        ? d.files.map(f => fileCard(f)).join("")
+        : `<div class="empty">لا توجد نتائج.</div>`;
+
+  } catch (e){
+    toast(e.message);
+  }
+}
+
+
+// ============================================================
+// File actions
+// ============================================================
+
+function currentFile(id){
+  return state.currentFiles.find(f => Number(f.id) === Number(id));
+}
+
+function openFileMenu(id){
+  const file = currentFile(id);
+
+  // Search/home recent files are not necessarily in currentFiles.
+  // We can still perform ID-based operations safely.
+  const name = file?.name || "الملف";
+  const path = file?.path || "";
+
+  openSheet(`
+    <h3>${esc(name)}</h3>
+    ${path ? `<div class="destpath">📁 ${esc(path)}</div>` : ""}
+
+    <button class="action primary" onclick="retrieveFile(${id})">
+      📤 استرجاع إلى المحادثة
+    </button>
+
+    <button class="action" onclick="moveSingle(${id})">
+      📁 نقل إلى مجلد…
+    </button>
+
+    <button class="action danger" onclick="deleteFile(${id})">
+      🗑 حذف الملف
+    </button>
+
+    <button class="action" onclick="closeSheet()">
+      إلغاء
+    </button>
+  `);
+}
+
+async function retrieveFile(id){
+  if (state.busy) return;
+
+  try {
+    setBusy(true);
+
+    await api("/files/retrieve", {
+      method:"POST",
+      body:JSON.stringify({file_id:id})
+    });
+
+    closeSheet();
+    toast("أرسلته لك في المحادثة ✅");
+
+  } catch (e){
+    toast(e.message);
+
+  } finally {
+    setBusy(false);
+  }
+}
+
+function moveSingle(id){
+  closeSheet();
+  state.selectionMode = "saved";
+  state.selected = new Set([id]);
+  syncSelectionBar();
+  openDestination();
+}
+
+async function deleteFile(id){
+  const confirmed = confirm("حذف الملف نهائيًا؟");
+  if (!confirmed || state.busy) return;
+
+  try {
+    setBusy(true);
+
+    await api("/files/delete", {
+      method:"POST",
+      body:JSON.stringify({file_id:id})
+    });
+
+    closeSheet();
+    toast("تم حذف الملف ✅");
+
+    if (state.tab === "files"){
+      await openFolder(state.folderId);
+    } else if (state.tab === "search"){
+      await runSearch();
+    } else {
+      await goHome();
+    }
+
+  } catch (e){
+    toast(e.message);
+
+  } finally {
+    setBusy(false);
+  }
+}
+
+
+// ============================================================
+// Folder actions
+// ============================================================
+
+function openFolderMenu(id){
+  const folder = folderById(id);
+  if (!folder) return;
+
+  openSheet(`
+    <h3>📁 ${esc(folder.name)}</h3>
+
+    <button class="action" onclick="renameFolder(${id})">
+      ✏️ إعادة التسمية
+    </button>
+
+    <button class="action danger" onclick="deleteFolder(${id})">
+      🗑 حذف المجلد
+    </button>
+
+    <button class="action" onclick="closeSheet()">
+      إلغاء
+    </button>
+  `);
+}
+
+async function renameFolder(id){
+  const folder = folderById(id);
+  if (!folder) return;
+
+  const name = prompt("الاسم الجديد:", folder.name);
+  if (!name) return;
+
+  try {
+    setBusy(true);
+
+    await api("/folders/rename", {
+      method:"POST",
+      body:JSON.stringify({
+        folder_id:id,
+        name
+      })
+    });
+
+    await loadTree(true);
+    closeSheet();
+    toast("تم تغيير الاسم ✅");
+
+    if (state.tab === "files"){
+      await openFolder(state.folderId);
+    } else {
+      await goHome();
+    }
+
+  } catch (e){
+    toast(e.message);
+
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function deleteFolder(id){
+  if (!confirm("حذف المجلد؟ يجب أن يكون فارغًا.")) return;
+
+  try {
+    setBusy(true);
+
+    const d = await api("/folders/delete", {
+      method:"POST",
+      body:JSON.stringify({folder_id:id})
+    });
+
+    await loadTree(true);
+    closeSheet();
+    toast("تم حذف المجلد ✅");
+
+    if (state.folderId === id){
+      await openFolder(d.parent_id ?? null);
+    } else {
+      await openFolder(state.folderId);
+    }
+
+  } catch (e){
+    toast(e.message);
+
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function createFolderHere(){
+  closeSheet();
+
+  const name = prompt("اسم المجلد الجديد:");
+  if (!name) return;
+
+  try {
+    setBusy(true);
+
+    await api("/folders", {
+      method:"POST",
+      body:JSON.stringify({
+        name,
+        parent_id: state.folderId
+      })
+    });
+
+    await loadTree(true);
+    toast("تم إنشاء المجلد ✅");
+
+    if (state.tab === "files"){
+      await openFolder(state.folderId);
+    }
+
+  } catch (e){
+    toast(e.message);
+
+  } finally {
+    setBusy(false);
+  }
+}
+
+
+// ============================================================
+// + button
+// ============================================================
+
+function openAddMenu(){
+  openSheet(`
+    <h3>＋ إضافة</h3>
+
+    <button class="action primary" onclick="addFileFromTelegram()">
+      📤 إضافة ملف
+    </button>
+
+    <button class="action" onclick="createFolderHere()">
+      📁 إنشاء مجلد
+    </button>
+
+    <button class="action" onclick="closeSheet()">
+      إلغاء
+    </button>
+  `);
+}
+
+function addFileFromTelegram(){
+  closeSheet();
+
+  // Telegram Mini Apps cannot attach a local file to the same bot chat
+  // directly through the WebApp API. Return the user to the bot chat,
+  // where Telegram's native attachment picker does the job.
+  try {
+    tg.openTelegramLink(BOT_LINK);
+  } catch (_) {
+    window.location.href = BOT_LINK;
+  }
+}
+
+
+// ============================================================
+// Destination chooser - LOCAL tree, no request per click
+// ============================================================
+
+async function openDestination(startId=null){
+  if (!state.selected.size){
+    toast("حدد ملفًا أولًا");
+    return;
+  }
+
+  try {
+    await loadTree();
+    renderDestination(startId);
+  } catch (e){
+    toast(e.message);
+  }
+}
+
+function renderDestination(folderId){
+  const folder = folderId == null ? null : folderById(folderId);
+  const children = childrenOf(folderId);
+  const path = folderId == null
+    ? []
+    : folderPathIds(folderId);
+
+  openSheet(`
+    <h3>📁 اختر مكان الحفظ</h3>
+
+    <div class="destpath">
+      ملفاتي
+      ${path.length ? " / " + path.map(x => esc(x.name)).join(" / ") : ""}
+    </div>
+
+    <button class="action primary"
+            onclick="finishDestination(${folderId == null ? "null" : folderId},this)">
+      ✅ ${folderId == null ? "الحفظ في ملفاتي" : "الحفظ في هذا المجلد"}
+    </button>
+
+    ${children.map(f => `
+      <button class="action"
+              onclick="renderDestination(${f.id})">
+        📁 ${esc(f.name)}
+      </button>
+    `).join("")}
+
+    ${folderId != null
+      ? `<button class="action"
+                 onclick="renderDestination(${folder?.parent_id == null ? "null" : folder.parent_id})">
+           ↩️ رجوع
+         </button>`
+      : ""
+    }
+
+    <button class="action" onclick="closeSheet()">إلغاء</button>
+  `);
+}
+
+async function finishDestination(folderId, button){
+  if (state.busy) return;
+
+  const ids = [...state.selected];
+  if (!ids.length) return;
+
+  const oldText = button?.textContent;
+
+  try {
+    setBusy(true);
+
+    if (button){
+      button.disabled = true;
+      button.textContent = "⏳ جارٍ الحفظ…";
+    }
+
+    if (state.selectionMode === "pending"){
+      const d = await api("/pending/save", {
+        method:"POST",
+        body:JSON.stringify({
+          file_ids:ids,
+          folder_id:folderId
+        })
+      });
+
+      if (d.failed?.length){
+        toast(`حُفظ ${d.saved.length} وفشل ${d.failed.length}`);
+      } else {
+        toast(`حُفظ ${d.saved.length} ملف ✅`);
+      }
+
+      closeSheet();
+      state.selected.clear();
+      syncSelectionBar();
+      await goInbox();
+
+    } else {
+      const d = await api("/files/move", {
+        method:"POST",
+        body:JSON.stringify({
+          file_ids:ids,
+          folder_id:folderId
+        })
+      });
+
+      toast(`نُقل ${d.moved} ملف ✅`);
+
+      closeSheet();
+      state.selected.clear();
+      state.selectingSaved = false;
+      syncSelectionBar();
+      await openFolder(folderId);
+    }
+
+  } catch (e){
+    toast(e.message);
+
+  } finally {
+    setBusy(false);
+
+    if (button){
+      button.disabled = false;
+      button.textContent = oldText;
+    }
+  }
+}
+
+
+// ============================================================
+// Boot
+// ============================================================
+
 goHome();
 </script>
-</body></html>
+</body>
+</html>
