@@ -647,7 +647,9 @@ def extract_file(message):
                 "file_unique_id": obj.get("file_unique_id"),
                 "file_name": obj.get("file_name") or default_name,
                 "file_size": obj.get("file_size") or 0,
-                "mime_type": obj.get("mime_type"),
+                "mime_type": obj.get("mime_type") or (
+                    "application/octet-stream" if kind == "document" else None
+                ),
                 "media_type": kind,
             }
 
@@ -938,8 +940,8 @@ def home_screen(chat_id, user_id, message_id=None):
 
     text = (
         "📚 <b>الوَرّاق</b>\n\n"
-        "مكتبتك الخاصة داخل تيليجرام.\n"
-        "أرسل ملفًا لحفظه، أو استخدم الخيارات:"
+        "أرسل ملفاتك هنا مباشرة، ثم نظّمها من الواجهة.\n"
+        "أو افتح مكتبتك الآن:"
     )
 
     if count:
