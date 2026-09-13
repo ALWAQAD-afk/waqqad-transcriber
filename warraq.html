@@ -123,6 +123,51 @@ button{cursor:pointer}
   border-radius:12px;padding:9px 11px
 }
 .destpath{color:var(--hint);font-size:13px;margin-bottom:10px}
+
+/* RC3.2 — perceived-speed polish */
+#app{
+  transition:opacity .16s ease, filter .16s ease, transform .16s ease;
+}
+#app.evaporating{
+  opacity:.18;
+  filter:blur(5px);
+  transform:translateY(-4px) scale(.995);
+}
+#app.appearing{
+  animation:warraqAppear .20s ease-out both;
+}
+@keyframes warraqAppear{
+  from{opacity:0;filter:blur(5px);transform:translateY(5px)}
+  to{opacity:1;filter:blur(0);transform:none}
+}
+.toast{
+  opacity:0;
+}
+.toast.show{
+  opacity:1;
+}
+.toast.vanish{
+  animation:warraqVanish .42s ease-in forwards;
+}
+@keyframes warraqVanish{
+  to{
+    opacity:0;
+    filter:blur(7px);
+    transform:translateX(-50%) translateY(-16px) scale(.96);
+  }
+}
+.skeleton{
+  background:linear-gradient(90deg,var(--card),rgba(127,127,127,.13),var(--card));
+  background-size:220% 100%;
+  animation:warraqShimmer 1.1s linear infinite;
+  border-radius:16px;
+}
+@keyframes warraqShimmer{
+  from{background-position:220% 0}
+  to{background-position:-220% 0}
+}
+.skeleton-line{height:56px;margin:9px 0}
+
 </style>
 </head>
 <body>
@@ -170,6 +215,91 @@ const state = {
   busy: false,
 };
 
+// RC3.2 cache: instant UI first, network refresh second.
+const CACHE_VERSION = "warraq-rc3.2";
+const CACHE_TTL = {
+  bootstrap: 60_000,
+  tree: 120_000,
+  folder: 45_000,
+  inbox: 15_000
+};
+
+const memCache = new Map();
+
+function cacheKey(type, key=""){
+  return `${CACHE_VERSION}:${type}:${key}`;
+}
+
+function cacheSet(type, key, value){
+  const item = {at:Date.now(), value};
+  memCache.set(cacheKey(type,key), item);
+  try{
+    sessionStorage.setItem(cacheKey(type,key), JSON.stringify(item));
+  }catch(_){}
+}
+
+function cacheGet(type, key="", ttl=30_000){
+  const k = cacheKey(type,key);
+  let item = memCache.get(k);
+
+  if(!item){
+    try{
+      const raw = sessionStorage.getItem(k);
+      if(raw) item = JSON.parse(raw);
+    }catch(_){}
+  }
+
+  if(!item) return null;
+  if(Date.now() - Number(item.at || 0) > ttl) return null;
+
+  memCache.set(k,item);
+  return item.value;
+}
+
+function cacheDrop(type, key=""){
+  const k = cacheKey(type,key);
+  memCache.delete(k);
+  try{ sessionStorage.removeItem(k); }catch(_){}
+}
+
+function invalidateFolderCaches(){
+  for(const k of [...memCache.keys()]){
+    if(k.includes(":folder:") || k.includes(":bootstrap:")){
+      memCache.delete(k);
+    }
+  }
+  try{
+    for(let i=sessionStorage.length-1;i>=0;i--){
+      const k=sessionStorage.key(i);
+      if(k && k.startsWith(CACHE_VERSION) &&
+         (k.includes(":folder:") || k.includes(":bootstrap:"))){
+        sessionStorage.removeItem(k);
+      }
+    }
+  }catch(_){}
+}
+
+async function evaporateTo(html){
+  const app = document.getElementById("app");
+  app.classList.remove("appearing");
+  app.classList.add("evaporating");
+  await new Promise(r=>setTimeout(r,120));
+  app.innerHTML = html;
+  app.classList.remove("evaporating");
+  void app.offsetWidth;
+  app.classList.add("appearing");
+}
+
+function skeletonPage(){
+  return `
+    <div class="skeleton skeleton-line"></div>
+    <div class="skeleton skeleton-line"></div>
+    <div class="skeleton skeleton-line"></div>
+    <div class="skeleton skeleton-line"></div>
+  `;
+}
+
+
 function esc(s=""){
   return String(s).replace(/[&<>"']/g, c => ({
     "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
@@ -204,10 +334,18 @@ async function api(path, options={}){
 
 function toast(message){
   const el = document.getElementById("toast");
+  el.classList.remove("vanish","show");
+  void el.offsetWidth;
   el.textContent = message;
   el.classList.add("show");
+
   clearTimeout(window.__toastTimer);
-  window.__toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
+  window.__toastTimer = setTimeout(() => {
+    el.classList.add("vanish");
+    setTimeout(() => {
+      el.classList.remove("show","vanish");
+    }, 430);
+  }, 1500);
 }
 
 function setTab(name){
@@ -269,9 +407,19 @@ function folderPathIds(id){
 }
 
 async function loadTree(force=false){
-  if (state.folderTree.length && !force) return state.folderTree;
+  if(state.folderTree.length && !force) return state.folderTree;
+
+  if(!force){
+    const cached = cacheGet("tree","all",CACHE_TTL.tree);
+    if(cached){
+      state.folderTree = cached;
+      return state.folderTree;
+    }
+  }
+
   const d = await api("/tree");
   state.folderTree = d.folders || [];
+  cacheSet("tree","all",state.folderTree);
   return state.folderTree;
 }
 
@@ -374,15 +522,10 @@ async function goHome(){
   state.selectionMode = null;
   state.selectingSaved = false;
   syncSelectionBar();
-
   document.getElementById("fab").style.display = "none";
-  document.getElementById("app").innerHTML =
-    `<div class="empty">جاري التحميل…</div>`;
 
-  try {
-    const d = await api("/bootstrap");
+  function renderHome(d){
     state.folderTree = d.folders || [];
-
     const roots = rootFolders();
 
     document.getElementById("app").innerHTML = `
@@ -403,7 +546,6 @@ async function goHome(){
           <b>${d.inbox_count}</b>
           <span>في الوارد</span>
         </div>
-
         <div class="stat" onclick="openFolder(null)">
           <b>${d.total_files}</b>
           <span>ملف محفوظ</span>
@@ -428,15 +570,29 @@ async function goHome(){
         }
       </div>
     `;
+  }
 
-  } catch (e){
-    document.getElementById("app").innerHTML = `
-      <div class="empty">
-        <div style="font-size:48px">📚</div>
-        <h2>افتح الوَرّاق من داخل Telegram</h2>
-        <p>${esc(e.message)}</p>
-      </div>
-    `;
+  const cached = cacheGet("bootstrap","main",CACHE_TTL.bootstrap);
+  if(cached){
+    renderHome(cached);
+  }else{
+    await evaporateTo(skeletonPage());
+  }
+
+  try{
+    const d = await api("/bootstrap");
+    cacheSet("bootstrap","main",d);
+    cacheSet("tree","all",d.folders || []);
+    renderHome(d);
+  }catch(e){
+    if(!cached){
+      document.getElementById("app").innerHTML = `
+        <div class="empty">
+          <div style="font-size:48px">📚</div>
+          <h2>افتح الوَرّاق من داخل Telegram</h2>
+          <p>${esc(e.message)}</p>
+        </div>`;
+    }
   }
 }
 
@@ -452,22 +608,29 @@ async function openFolder(id){
   state.selected.clear();
   state.selectingSaved = false;
   syncSelectionBar();
-
   document.getElementById("fab").style.display = "block";
-  document.getElementById("app").innerHTML =
-    `<div class="empty">جاري فتح المجلد…</div>`;
 
-  try {
-    await loadTree();
+  await loadTree();
 
+  const key = String(id ?? "root");
+  const cached = cacheGet("folder",key,CACHE_TTL.folder);
+
+  if(cached){
+    state.currentFiles = cached.files || [];
+    state.currentBreadcrumb = cached.breadcrumb || [];
+    renderCurrentFolder();
+  }else{
+    await evaporateTo(skeletonPage());
+  }
+
+  try{
     const d = await api("/folder?id=" + (id ?? "root"));
     state.currentFiles = d.files || [];
     state.currentBreadcrumb = d.breadcrumb || [];
-
+    cacheSet("folder",key,d);
     renderCurrentFolder();
-
-  } catch (e){
-    toast(e.message);
+  }catch(e){
+    if(!cached) toast(e.message);
   }
 }
 
@@ -543,18 +706,24 @@ async function goInbox(){
   state.selected.clear();
   state.selectingSaved = false;
   syncSelectionBar();
-
   document.getElementById("fab").style.display = "block";
-  document.getElementById("app").innerHTML =
-    `<div class="empty">جاري تحميل الوارد…</div>`;
 
-  try {
+  const cached = cacheGet("inbox","main",CACHE_TTL.inbox);
+
+  if(cached){
+    state.currentFiles = cached.files || [];
+    renderInboxFromCache();
+  }else{
+    await evaporateTo(skeletonPage());
+  }
+
+  try{
     const d = await api("/inbox");
     state.currentFiles = d.files || [];
+    cacheSet("inbox","main",d);
     renderInboxFromCache();
-
-  } catch (e){
-    toast(e.message);
+  }catch(e){
+    if(!cached) toast(e.message);
   }
 }
 
@@ -751,6 +920,8 @@ async function deleteFile(id){
       body:JSON.stringify({file_id:id})
     });
 
+    invalidateFolderCaches();
+    cacheDrop("inbox","main");
     closeSheet();
     toast("تم حذف الملف ✅");
 
@@ -844,6 +1015,7 @@ async function deleteFolder(id){
     });
 
     await loadTree(true);
+    invalidateFolderCaches();
     closeSheet();
     toast("تم حذف المجلد ✅");
 
@@ -879,6 +1051,7 @@ async function createFolderHere(){
     });
 
     await loadTree(true);
+    invalidateFolderCaches();
     toast("تم إنشاء المجلد ✅");
 
     if (state.tab === "files"){
@@ -1022,6 +1195,9 @@ async function finishDestination(folderId, button){
         })
       });
 
+      cacheDrop("inbox","main");
+      invalidateFolderCaches();
+
       if (d.failed?.length){
         toast(`حُفظ ${d.saved.length} وفشل ${d.failed.length}`);
       } else {
@@ -1042,6 +1218,7 @@ async function finishDestination(folderId, button){
         })
       });
 
+      invalidateFolderCaches();
       toast(`نُقل ${d.moved} ملف ✅`);
 
       closeSheet();
