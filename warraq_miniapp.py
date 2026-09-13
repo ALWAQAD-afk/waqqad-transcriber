@@ -883,8 +883,8 @@ def register_warraq_miniapp(app):
                     "reply_markup": {
                         "inline_keyboard": [[
                             {
-                                "text": "📚 فتح الوَرّاق",
-                                "web_app": {"url": MINIAPP_URL},
+                                "text": "🏠 الرئيسية",
+                                "callback_data": "panel",
                             }
                         ]]
                     },
