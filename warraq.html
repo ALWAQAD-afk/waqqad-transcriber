@@ -42,7 +42,8 @@ button{cursor:pointer}
 .ghost{border:0;background:transparent;color:var(--link);padding:7px}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .folder{
-  position:relative;border:0;color:var(--text);padding:16px;text-align:right;min-height:98px
+  position:relative;border:0;color:var(--text);padding:16px;text-align:right;min-height:98px;
+  cursor:pointer;overflow:hidden
 }
 .folder .ico{font-size:29px;display:block;margin-bottom:8px}
 .folder .name{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-left:26px}
@@ -304,12 +305,15 @@ function fileCard(file, selectable=false){
 
 function folderCard(folder){
   return `
-    <button class="folder" onclick="openFolder(${folder.id})">
+    <div class="folder" role="button" tabindex="0"
+         onclick="openFolder(${folder.id})"
+         onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openFolder(${folder.id})}">
       <button class="folderdots"
+              aria-label="خيارات المجلد"
               onclick="event.stopPropagation();openFolderMenu(${folder.id})">⋮</button>
       <span class="ico">${folder.icon || "📁"}</span>
       <div class="name">${esc(folder.name)}</div>
-    </button>
+    </div>
   `;
 }
 
@@ -915,13 +919,23 @@ function openAddMenu(){
 function addFileFromTelegram(){
   closeSheet();
 
-  // Telegram Mini Apps cannot attach a local file to the same bot chat
-  // directly through the WebApp API. Return the user to the bot chat,
-  // where Telegram's native attachment picker does the job.
+  // Telegram does not expose the native paperclip/file picker to Mini Apps.
+  // The reliable flow is to close the Mini App and return to the bot chat,
+  // where the user can attach the file normally.
   try {
-    tg.openTelegramLink(BOT_LINK);
+    tg.HapticFeedback?.impactOccurred("light");
+  } catch (_) {}
+
+  try {
+    tg.showPopup?.({
+      title: "إضافة ملف",
+      message: "سأعيدك إلى محادثة الوَرّاق. اضغط زر المشبك وأرسل الملف، وسيظهر تلقائيًا في الوارد.",
+      buttons: [
+        {id: "ok", type: "default", text: "حسنًا"}
+      ]
+    }, () => tg.close());
   } catch (_) {
-    window.location.href = BOT_LINK;
+    tg.close();
   }
 }
 
