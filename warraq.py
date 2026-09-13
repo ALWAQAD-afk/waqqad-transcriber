@@ -2,6 +2,7 @@ import os
 import json
 import html
 import logging
+import threading
 from datetime import datetime, timezone
 
 import requests
@@ -196,6 +197,14 @@ def init_db():
             )
         """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_ui_state (
+                user_id BIGINT PRIMARY KEY,
+                panel_message_id BIGINT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
     run_tx(_work)
 
 
@@ -287,6 +296,68 @@ def delete_message(chat_id, message_id):
         })
     except Exception:
         log.exception("deleteMessage failed")
+
+
+
+def _get_panel_message_id(user_id):
+    def _work(conn):
+        row = conn.execute("""
+            SELECT panel_message_id
+            FROM user_ui_state
+            WHERE user_id=%s
+        """, (user_id,)).fetchone()
+        return row["panel_message_id"] if row else None
+    return run_tx(_work)
+
+
+def _set_panel_message_id(user_id, message_id):
+    def _work(conn):
+        conn.execute("""
+            INSERT INTO user_ui_state(user_id,panel_message_id,updated_at)
+            VALUES(%s,%s,NOW())
+            ON CONFLICT(user_id) DO UPDATE SET
+                panel_message_id=EXCLUDED.panel_message_id,
+                updated_at=NOW()
+        """, (user_id, message_id))
+    run_tx(_work)
+
+
+def send_panel(chat_id, user_id, text, keyboard):
+    """Keep only one persistent bot control panel in the private chat."""
+    old_id = _get_panel_message_id(user_id)
+
+    if old_id:
+        try:
+            delete_message(chat_id, old_id)
+        except Exception:
+            pass
+
+    result = send(chat_id, text, keyboard)
+    new_id = result.get("message_id") if isinstance(result, dict) else None
+
+    if new_id:
+        _set_panel_message_id(user_id, new_id)
+
+    return result
+
+
+def send_ephemeral(chat_id, text, keyboard=None, ttl=8):
+    """Short confirmation that removes itself to keep the chat clean."""
+    result = send(chat_id, text, keyboard)
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+
+    if message_id:
+        def _expire():
+            try:
+                delete_message(chat_id, message_id)
+            except Exception:
+                pass
+
+        timer = threading.Timer(ttl, _expire)
+        timer.daemon = True
+        timer.start()
+
+    return result
 
 
 def btn(text, data):
@@ -934,7 +1005,7 @@ def delete_saved_file(user_id, file_id):
 # Screens
 # ============================================================
 
-def home_screen(chat_id, user_id, message_id=None):
+def home_screen(chat_id, user_id, message_id=None, force_new=False):
     ensure_user(user_id)
     count = pending_count(user_id)
 
@@ -945,25 +1016,17 @@ def home_screen(chat_id, user_id, message_id=None):
     )
 
     if count:
-        text += f"\n\n📥 لديك <b>{count}</b> ملف/ملفات بانتظار التنظيم."
+        text += f"\n\n📥 لديك <b>{count}</b> ملف/ملفات في الوارد."
 
     keyboard = [
         [webapp_btn("📚 فتح الوَرّاق")],
-        [
-            btn("📂 ملفاتي", "browse:root:0"),
-            btn("🔎 بحث", "search"),
-        ],
     ]
 
-    if count:
-        keyboard.append([
-            btn(f"📚 تنظيم المعلّق ({count})", "pending")
-        ])
-
-    if message_id:
-        edit(chat_id, message_id, text, keyboard)
+    if force_new or not message_id:
+        send_panel(chat_id, user_id, text, keyboard)
     else:
-        send(chat_id, text, keyboard)
+        edit(chat_id, message_id, text, keyboard)
+        _set_panel_message_id(user_id, message_id)
 
 
 def browse_screen(
@@ -1224,15 +1287,13 @@ def handle_file_message(message):
     pending_id = insert_pending(user_id, f)
     count = pending_count(user_id)
 
-    send(
+    send_ephemeral(
         chat_id,
         f"✅ أضفت <b>{esc(f['file_name'])}</b> إلى <b>الوارد</b>.\n"
-        f"📦 {human_size(f['file_size'])}\n\n"
+        f"📦 {human_size(f['file_size'])}\n"
         f"📥 في الوارد الآن: <b>{count}</b>",
-        [
-            [webapp_btn("📚 فتح الوَرّاق وتنظيم الملفات")],
-            [btn("⚙️ الواجهة القديمة", f"pickone:{pending_id}:root")],
-        ],
+        [[webapp_btn("📚 فتح الوَرّاق")]],
+        ttl=8,
     )
 
 
@@ -1254,7 +1315,7 @@ def handle_text_message(message):
 
     if command == "/start":
         clear_state(user_id)
-        home_screen(chat_id, user_id)
+        home_screen(chat_id, user_id, force_new=True)
         return
 
     if command == "/files":
@@ -1416,6 +1477,11 @@ def handle_callback(q):
     if data == "home":
         clear_state(user_id)
         home_screen(chat_id, user_id, message_id)
+        return
+
+    if data == "panel":
+        clear_state(user_id)
+        home_screen(chat_id, user_id, force_new=True)
         return
 
     if data == "search":
