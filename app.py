@@ -697,6 +697,12 @@ def telegram_send_message(chat_id, text, reply_markup=None):
         data=payload,
         timeout=30
     )
+    print(
+        f"[TRANSCRIBER CHAT] Telegram HTTP {response.status_code}: "
+        f"{response.text[:500]}",
+        flush=True
+    )
+
     if response.status_code != 200:
         raise RuntimeError(
             f"Telegram sendMessage HTTP {response.status_code}: "
@@ -711,11 +717,19 @@ def handle_transcriber_chat_update(update):
         or update.get("edited_message")
     )
     if not message:
+        print(
+            "[TRANSCRIBER CHAT] Update has no message/edited_message; ignored.",
+            flush=True
+        )
         return
 
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
     if not chat_id:
+        print(
+            "[TRANSCRIBER CHAT] Message has no chat_id; ignored.",
+            flush=True
+        )
         return
 
     # لا نرد على رسائل البوت نفسه.
@@ -725,6 +739,12 @@ def handle_transcriber_chat_update(update):
 
     count = TRANSCRIBER_CHAT_COUNTS.get(chat_id, 0) + 1
     TRANSCRIBER_CHAT_COUNTS[chat_id] = count
+
+    print(
+        f"[TRANSCRIBER CHAT] chat_id={chat_id}, message #{count}, "
+        f"content_keys={list(message.keys())}",
+        flush=True
+    )
 
     keyboard = {
         "inline_keyboard": [[{
@@ -752,6 +772,10 @@ def handle_transcriber_chat_update(update):
             "والآن… زر التفريغ ينتظرك 👇"
         )
 
+    print(
+        f"[TRANSCRIBER CHAT] Sending reply for message #{count}...",
+        flush=True
+    )
     telegram_send_message(
         chat_id,
         text,
@@ -1117,14 +1141,31 @@ def transcriber_webhook():
         silent=True
     )
 
-    if update:
-        try:
-            handle_transcriber_chat_update(update)
-        except Exception as e:
-            print(
-                f"[TRANSCRIBER BOT ERROR] {e}",
-                flush=True
-            )
+    print(
+        "[TRANSCRIBER WEBHOOK] update received",
+        flush=True
+    )
+
+    if not update:
+        print(
+            "[TRANSCRIBER WEBHOOK] Empty/invalid JSON update.",
+            flush=True
+        )
+        return jsonify({"status": "ok"}), 200
+
+    print(
+        f"[TRANSCRIBER WEBHOOK] update_id={update.get('update_id')}, "
+        f"keys={list(update.keys())}",
+        flush=True
+    )
+
+    try:
+        handle_transcriber_chat_update(update)
+    except Exception as e:
+        print(
+            f"[TRANSCRIBER BOT ERROR] {type(e).__name__}: {e}",
+            flush=True
+        )
 
     return jsonify({"status": "ok"}), 200
 
