@@ -5,6 +5,7 @@ import threading
 import mimetypes
 import subprocess
 import shutil
+import re
 import time
 from pathlib import Path
 from warraq import handle_warraq_update
@@ -335,32 +336,65 @@ def cohere_transcribe_part(job_id, part, part_index, part_count):
     )
 
 def finalize_transcript(job_id, transcript, engine):
-    """حفظ النص وإرساله إلى Telegram وتحديث حالة المهمة."""
+    """Save the transcript using the original filename and send a short summary."""
     work_dir = Path("/tmp") / f"waqqad_{job_id}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    output_file = work_dir / "transcription.txt"
-    output_file.write_text(
-        transcript,
-        encoding="utf-8"
+    job = get_job(job_id) or {}
+    original_filename = job.get("original_filename") or "transcription"
+    download_name = transcript_download_name(original_filename)
+
+    output_file = work_dir / download_name
+    output_file.write_text(transcript, encoding="utf-8")
+
+    telegram_user_id = job.get("telegram_user_id")
+    started_at = job.get("started_at")
+    completed_at = time.time()
+    processing_seconds = (
+        max(0.0, completed_at - float(started_at))
+        if started_at is not None else None
     )
 
-    job = get_job(job_id) or {}
-    telegram_user_id = job.get("telegram_user_id")
+    engine_label = (
+        "Cohere Arabic"
+        if engine == "cohere"
+        else "Deepgram (احتياطي)"
+    )
+    total_parts = job.get("total_parts") or 1
+
+    if processing_seconds is None:
+        duration_text = "غير متاح"
+    elif processing_seconds < 60:
+        duration_text = f"{processing_seconds:.1f} ثانية"
+    else:
+        minutes = int(processing_seconds // 60)
+        seconds = int(round(processing_seconds % 60))
+        duration_text = f"{minutes} د {seconds} ث"
+
+    caption = (
+        "✅ اكتمل تفريغ الملف بنجاح.\n"
+        f"⏱️ وقت المعالجة: {duration_text}\n"
+        f"⚙️ المحرك: {engine_label}\n"
+        f"🧩 الأجزاء: {total_parts}"
+    )
 
     update_job(
         job_id,
         status="processing",
         stage="sending_to_telegram",
         engine=engine,
-        output_file=str(output_file)
+        output_file=str(output_file),
+        output_name=download_name,
+        processing_seconds=processing_seconds
     )
 
     try:
         if telegram_user_id:
             send_transcript_to_telegram(
                 telegram_user_id,
-                output_file
+                output_file,
+                download_name=download_name,
+                caption=caption
             )
             telegram_sent = True
             telegram_error = None
@@ -370,10 +404,7 @@ def finalize_transcript(job_id, transcript, engine):
     except Exception as e:
         telegram_sent = False
         telegram_error = str(e)
-        print(
-            f"[TELEGRAM ERROR] Job {job_id}: {e}",
-            flush=True
-        )
+        print(f"[TELEGRAM ERROR] Job {job_id}: {e}", flush=True)
 
     update_job(
         job_id,
@@ -381,10 +412,12 @@ def finalize_transcript(job_id, transcript, engine):
         stage="done",
         engine=engine,
         output_file=str(output_file),
+        output_name=download_name,
+        completed_at=completed_at,
+        processing_seconds=processing_seconds,
         telegram_sent=telegram_sent,
         telegram_error=telegram_error
     )
-
 
 def submit_to_deepgram(job_id, input_file, fallback_reason=None):
     """Deepgram Nova-3: المحرك الاحتياطي، مع callback كما في V3."""
@@ -621,19 +654,27 @@ def process_transcription_job(job_id, input_file):
         )
 
 
+def transcript_download_name(original_filename):
+    """Build a TXT filename from the original upload name."""
+    name = Path(original_filename or "transcription").name
+    stem = Path(name).stem.strip() or "transcription"
+    stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", stem)
+    stem = re.sub(r"\s+", " ", stem).strip()
+    return f"{stem}.txt"
+
+
 # ============================================================
 # إرسال النتيجة عبر Telegram
 # ============================================================
 
 def send_transcript_to_telegram(
     telegram_user_id,
-    output_file
+    output_file,
+    download_name="transcription.txt",
+    caption="✅ اكتمل تفريغ الملف بنجاح."
 ):
-
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is not configured"
-        )
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
 
     url = (
         "https://api.telegram.org/"
@@ -641,17 +682,15 @@ def send_transcript_to_telegram(
     )
 
     with open(output_file, "rb") as document:
-
         response = requests.post(
             url,
             data={
                 "chat_id": telegram_user_id,
-                "caption":
-                    "✅ اكتمل تفريغ الملف بنجاح."
+                "caption": caption
             },
             files={
                 "document": (
-                    "transcription.txt",
+                    download_name,
                     document,
                     "text/plain"
                 )
@@ -660,8 +699,7 @@ def send_transcript_to_telegram(
         )
 
     print(
-        f"[TELEGRAM] HTTP "
-        f"{response.status_code}: "
+        f"[TELEGRAM] HTTP {response.status_code}: "
         f"{response.text[:500]}",
         flush=True
     )
@@ -786,6 +824,10 @@ def transcribe():
             "stage": "queued",
             "error": None,
             "output_file": None,
+            "original_filename": uploaded_file.filename,
+            "started_at": time.time(),
+            "completed_at": None,
+            "processing_seconds": None,
             "deepgram_request_id": None,
             "engine": None,
             "fallback_used": False,
@@ -965,7 +1007,7 @@ def download_result(job_id):
         output_file,
         as_attachment=True,
         download_name=
-            "transcription.txt",
+            job.get("output_name", "transcription.txt"),
         mimetype="text/plain"
     )
 
