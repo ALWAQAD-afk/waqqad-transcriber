@@ -74,14 +74,11 @@ TRANSCRIBER_WEBAPP_URL = os.environ.get(
     "https://alwaqad-afk.github.io/waqqad-transcriber-web/"
 )
 
-# عداد بسيط لرسائل الدردشة العادية. يكفي للمرحلة الحالية؛ يعاد ضبطه عند إعادة تشغيل الخادم.
-TRANSCRIBER_CHAT_COUNTS = {}
-TRANSCRIBER_POEMS = [
-    "وخيرُ جليسٍ في الزمانِ كتابُ",
-    "على قدرِ أهلِ العزمِ تأتي العزائمُ",
-    "ومن يتهيبْ صعودَ الجبالِ\nيعشْ أبدَ الدهرِ بين الحُفَرْ",
-    "إذا غامرتَ في شرفٍ مرومِ\nفلا تقنعْ بما دونَ النجومِ",
-]
+TRANSCRIBER_LOG_CHAT_ID = os.environ.get(
+    "TRANSCRIBER_LOG_CHAT_ID",
+    ""
+).strip()
+
 
 JOBS_FILE = Path("/tmp/waqqad_jobs.json")
 jobs_lock = threading.Lock()
@@ -433,6 +430,8 @@ def finalize_transcript(job_id, transcript, engine):
         telegram_error=telegram_error
     )
 
+    log_transcription_success(job_id)
+
 def submit_to_deepgram(job_id, input_file, fallback_reason=None):
     """Deepgram Nova-3: المحرك الاحتياطي، مع callback كما في V3."""
     if not DEEPGRAM_API_KEY:
@@ -442,6 +441,7 @@ def submit_to_deepgram(job_id, input_file, fallback_reason=None):
             stage="error",
             error="DEEPGRAM_API_KEY is not configured"
         )
+        log_transcription_failure(job_id)
         return
 
     try:
@@ -502,6 +502,7 @@ def submit_to_deepgram(job_id, input_file, fallback_reason=None):
                 stage="error",
                 error=f"Deepgram submit HTTP {response.status_code}"
             )
+            log_transcription_failure(job_id)
             return
 
         data = response.json()
@@ -532,6 +533,7 @@ def submit_to_deepgram(job_id, input_file, fallback_reason=None):
             stage="error",
             error=str(e)
         )
+        log_transcription_failure(job_id)
 
     finally:
         # بعد قبول Deepgram للرفع لا نحتاج الملف الأصلي محليًا.
@@ -660,6 +662,7 @@ def process_transcription_job(job_id, input_file):
             fallback_used=False,
             fallback_reason=None
         )
+        log_transcription_failure(job_id)
 
     finally:
         shutil.rmtree(
@@ -710,41 +713,112 @@ def telegram_send_message(chat_id, text, reply_markup=None):
         )
 
 
-def handle_transcriber_chat_update(update):
-    """Guide users to the WebApp; persistent chatter earns poetry :)"""
-    message = (
-        update.get("message")
-        or update.get("edited_message")
-    )
-    if not message:
+def _format_duration(seconds):
+    if seconds is None:
+        return "غير متاح"
+    seconds = max(0, int(round(float(seconds))))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours} س {minutes} د {secs} ث"
+    if minutes:
+        return f"{minutes} د {secs} ث"
+    return f"{secs} ث"
+
+
+def send_transcriber_log(text):
+    """Send metadata-only telemetry to the private Telegram log channel."""
+    if not TRANSCRIBER_LOG_CHAT_ID:
+        return
+    try:
+        telegram_send_message(TRANSCRIBER_LOG_CHAT_ID, text)
+    except Exception as e:
+        # Logging must never make a transcription fail.
         print(
-            "[TRANSCRIBER CHAT] Update has no message/edited_message; ignored.",
+            f"[TRANSCRIBER LOG ERROR] {type(e).__name__}: {e}",
             flush=True
         )
+
+
+def log_transcription_success(job_id):
+    job = get_job(job_id) or {}
+    filename = job.get("original_filename") or "غير معروف"
+    file_size = job.get("file_size_bytes")
+    size_text = (
+        f"{file_size / (1024 * 1024):.2f} MB"
+        if isinstance(file_size, (int, float))
+        else "غير متاح"
+    )
+    engine = job.get("engine")
+    engine_label = (
+        "Cohere Arabic" if engine == "cohere"
+        else "Deepgram (احتياطي)" if engine == "deepgram"
+        else str(engine or "غير معروف")
+    )
+    keys = job.get("cohere_keys_used") or []
+    keys_text = "، ".join(f"#{k}" for k in keys) if keys else "—"
+
+    send_transcriber_log(
+        "📊 تفريغ مكتمل\n"
+        f"👤 المستخدم: {job.get('telegram_user_id') or 'غير معروف'}\n"
+        f"📄 الملف: {filename}\n"
+        f"📦 الحجم: {size_text}\n"
+        f"⚙️ المحرك: {engine_label}\n"
+        f"🧩 الأجزاء: {job.get('total_parts') or 1}\n"
+        f"🔑 Cohere: {keys_text}\n"
+        f"⏱️ المعالجة: {_format_duration(job.get('processing_seconds'))}\n"
+        f"🆔 المهمة: {job_id}\n"
+        "✅ نجح"
+    )
+
+
+def log_transcription_failure(job_id):
+    job = get_job(job_id) or {}
+    filename = job.get("original_filename") or "غير معروف"
+    file_size = job.get("file_size_bytes")
+    size_text = (
+        f"{file_size / (1024 * 1024):.2f} MB"
+        if isinstance(file_size, (int, float))
+        else "غير متاح"
+    )
+    error = str(job.get("error") or "سبب غير معروف")
+    if len(error) > 1200:
+        error = error[:1200] + "…"
+
+    send_transcriber_log(
+        "❌ فشل تفريغ\n"
+        f"👤 المستخدم: {job.get('telegram_user_id') or 'غير معروف'}\n"
+        f"📄 الملف: {filename}\n"
+        f"📦 الحجم: {size_text}\n"
+        f"📍 المرحلة: {job.get('stage') or 'غير معروفة'}\n"
+        f"⚠️ السبب: {error}\n"
+        f"🆔 المهمة: {job_id}"
+    )
+
+
+def handle_transcriber_chat_update(update):
+    """Reply only to /start and /help; ordinary messages are ignored."""
+    message = update.get("message")
+    if not message:
         return
 
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
-    if not chat_id:
+    sender = message.get("from") or {}
+    if not chat_id or sender.get("is_bot"):
+        return
+
+    raw_text = (message.get("text") or "").strip()
+    if not raw_text.startswith("/"):
         print(
-            "[TRANSCRIBER CHAT] Message has no chat_id; ignored.",
+            f"[TRANSCRIBER CHAT] Ignored ordinary message from chat_id={chat_id}",
             flush=True
         )
         return
 
-    # لا نرد على رسائل البوت نفسه.
-    sender = message.get("from") or {}
-    if sender.get("is_bot"):
+    command = raw_text.split(None, 1)[0].split("@", 1)[0].lower()
+    if command not in {"/start", "/help"}:
         return
-
-    count = TRANSCRIBER_CHAT_COUNTS.get(chat_id, 0) + 1
-    TRANSCRIBER_CHAT_COUNTS[chat_id] = count
-
-    print(
-        f"[TRANSCRIBER CHAT] chat_id={chat_id}, message #{count}, "
-        f"content_keys={list(message.keys())}",
-        flush=True
-    )
 
     keyboard = {
         "inline_keyboard": [[{
@@ -753,34 +827,22 @@ def handle_transcriber_chat_update(update):
         }]]
     }
 
-    if count == 1:
-        text = (
+    if command == "/start":
+        reply = (
             "أهلًا بك في مفرّغ الوقّاد 🎙️\n\n"
-            "للتفريغ افتح مفرّغ النصوص من الزر أدناه، "
-            "ثم اختر ملفك الصوتي. ستصل النتيجة إلى هذه المحادثة فور اكتمالها."
-        )
-    elif count == 2:
-        text = (
-            "ما زال باب التفريغ هناك يا صاحبي 😄\n"
-            "اضغط «فتح مفرّغ النصوص» وأرسل الملف من الصفحة."
+            "افتح مفرّغ النصوص من الزر أدناه، ثم اختر ملفك الصوتي. "
+            "ستصل النتيجة إلى هذه المحادثة فور اكتمالها."
         )
     else:
-        poem = TRANSCRIBER_POEMS[(count - 3) % len(TRANSCRIBER_POEMS)]
-        text = (
-            "يبدو أنك مصرّ على مراسلتي بدل رفع الملف 😄\n\n"
-            f"«{poem}»\n\n"
-            "والآن… زر التفريغ ينتظرك 👇"
+        reply = (
+            "🎙️ لاستخدام مفرّغ الوقّاد:\n"
+            "1) افتح مفرّغ النصوص من الزر أدناه.\n"
+            "2) اختر الملف الصوتي وابدأ التفريغ.\n"
+            "3) بعد تأكيد استلام الملف يمكنك إغلاق الصفحة؛ "
+            "وستصل النتيجة هنا عند اكتمالها."
         )
 
-    print(
-        f"[TRANSCRIBER CHAT] Sending reply for message #{count}...",
-        flush=True
-    )
-    telegram_send_message(
-        chat_id,
-        text,
-        reply_markup=keyboard
-    )
+    telegram_send_message(chat_id, reply, reply_markup=keyboard)
 
 
 # ============================================================
@@ -945,6 +1007,7 @@ def transcribe():
             "error": None,
             "output_file": None,
             "original_filename": uploaded_file.filename,
+            "file_size_bytes": file_size,
             "started_at": time.time(),
             "completed_at": None,
             "processing_seconds": None,
@@ -1042,6 +1105,7 @@ def deepgram_callback(job_id):
                 "from Deepgram"
             )
         )
+        log_transcription_failure(job_id)
 
         return jsonify({
             "error": "bad payload"
@@ -1200,3 +1264,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=10000
     )
+ 
