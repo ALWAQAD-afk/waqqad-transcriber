@@ -69,6 +69,20 @@ BASE_URL = os.environ.get(
     "https://waqqad-transcriber.onrender.com"
 )
 
+TRANSCRIBER_WEBAPP_URL = os.environ.get(
+    "TRANSCRIBER_WEBAPP_URL",
+    "https://alwaqad-afk.github.io/waqqad-transcriber-web/"
+)
+
+# عداد بسيط لرسائل الدردشة العادية. يكفي للمرحلة الحالية؛ يعاد ضبطه عند إعادة تشغيل الخادم.
+TRANSCRIBER_CHAT_COUNTS = {}
+TRANSCRIBER_POEMS = [
+    "وخيرُ جليسٍ في الزمانِ كتابُ",
+    "على قدرِ أهلِ العزمِ تأتي العزائمُ",
+    "ومن يتهيبْ صعودَ الجبالِ\nيعشْ أبدَ الدهرِ بين الحُفَرْ",
+    "إذا غامرتَ في شرفٍ مرومِ\nفلا تقنعْ بما دونَ النجومِ",
+]
+
 JOBS_FILE = Path("/tmp/waqqad_jobs.json")
 jobs_lock = threading.Lock()
 
@@ -663,6 +677,88 @@ def transcript_download_name(original_filename):
     return f"{stem}.txt"
 
 
+def telegram_send_message(chat_id, text, reply_markup=None):
+    """Send a normal Telegram message from the transcriber bot."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(
+            reply_markup,
+            ensure_ascii=False
+        )
+
+    response = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        data=payload,
+        timeout=30
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Telegram sendMessage HTTP {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+
+def handle_transcriber_chat_update(update):
+    """Guide users to the WebApp; persistent chatter earns poetry :)"""
+    message = (
+        update.get("message")
+        or update.get("edited_message")
+    )
+    if not message:
+        return
+
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    if not chat_id:
+        return
+
+    # لا نرد على رسائل البوت نفسه.
+    sender = message.get("from") or {}
+    if sender.get("is_bot"):
+        return
+
+    count = TRANSCRIBER_CHAT_COUNTS.get(chat_id, 0) + 1
+    TRANSCRIBER_CHAT_COUNTS[chat_id] = count
+
+    keyboard = {
+        "inline_keyboard": [[{
+            "text": "🎙️ فتح مفرّغ النصوص",
+            "web_app": {"url": TRANSCRIBER_WEBAPP_URL}
+        }]]
+    }
+
+    if count == 1:
+        text = (
+            "أهلًا بك في مفرّغ الوقّاد 🎙️\n\n"
+            "للتفريغ افتح مفرّغ النصوص من الزر أدناه، "
+            "ثم اختر ملفك الصوتي. ستصل النتيجة إلى هذه المحادثة فور اكتمالها."
+        )
+    elif count == 2:
+        text = (
+            "ما زال باب التفريغ هناك يا صاحبي 😄\n"
+            "اضغط «فتح مفرّغ النصوص» وأرسل الملف من الصفحة."
+        )
+    else:
+        poem = TRANSCRIBER_POEMS[(count - 3) % len(TRANSCRIBER_POEMS)]
+        text = (
+            "يبدو أنك مصرّ على مراسلتي بدل رفع الملف 😄\n\n"
+            f"«{poem}»\n\n"
+            "والآن… زر التفريغ ينتظرك 👇"
+        )
+
+    telegram_send_message(
+        chat_id,
+        text,
+        reply_markup=keyboard
+    )
+
+
 # ============================================================
 # إرسال النتيجة عبر Telegram
 # ============================================================
@@ -1010,6 +1106,28 @@ def download_result(job_id):
             job.get("output_name", "transcription.txt"),
         mimetype="text/plain"
     )
+
+@app.route(
+    "/telegram/transcriber",
+    methods=["POST"]
+)
+def transcriber_webhook():
+    update = request.get_json(
+        force=True,
+        silent=True
+    )
+
+    if update:
+        try:
+            handle_transcriber_chat_update(update)
+        except Exception as e:
+            print(
+                f"[TRANSCRIBER BOT ERROR] {e}",
+                flush=True
+            )
+
+    return jsonify({"status": "ok"}), 200
+
 
 @app.route(
     "/telegram/warraq",
