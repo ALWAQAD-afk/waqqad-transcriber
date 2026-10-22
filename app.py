@@ -85,52 +85,99 @@ jobs_lock = threading.Lock()
 
 SUBMIT_TIMEOUT = 1800
 
-
 # ============================================================
-# تخزين المهام
+# تخزين المهام - PostgreSQL (Neon)
 # ============================================================
 
-def _load_jobs():
-    if JOBS_FILE.exists():
-        try:
-            return json.loads(
-                JOBS_FILE.read_text(encoding="utf-8")
-            )
-        except Exception:
-            return {}
+import psycopg
+from psycopg.rows import dict_row
 
-    return {}
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
+def get_db_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
-def _save_jobs(jobs):
-    JOBS_FILE.write_text(
-        json.dumps(jobs),
-        encoding="utf-8"
-    )
+def init_db():
+    """إنشاء جدول المهام إن لم يكن موجودًا."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY,
+                    data JSONB NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            conn.commit()
+    print("[DB] Jobs table ready", flush=True)
 
+# تهيئة الجدول عند بدء التشغيل
+try:
+    init_db()
+except Exception as e:
+    print(f"[DB] Warning: could not initialize table: {e}", flush=True)
 
 def create_job(job_id, data):
-    with jobs_lock:
-        jobs = _load_jobs()
-        jobs[job_id] = data
-        _save_jobs(jobs)
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO jobs (job_id, data)
+                VALUES (%s, %s)
+                ON CONFLICT (job_id) DO UPDATE
+                SET data = EXCLUDED.data,
+                    updated_at = NOW()
+                """,
+                (job_id, json.dumps(data))
+            )
+            conn.commit()
 
 def update_job(job_id, **updates):
-    with jobs_lock:
-        jobs = _load_jobs()
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT data FROM jobs WHERE job_id = %s",
+                (job_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return
 
-        if job_id in jobs:
-            jobs[job_id].update(updates)
-            _save_jobs(jobs)
+            current = row["data"]
+            if isinstance(current, str):
+                current = json.loads(current)
 
+            current.update(updates)
+
+            cur.execute(
+                """
+                UPDATE jobs
+                SET data = %s,
+                    updated_at = NOW()
+                WHERE job_id = %s
+                """,
+                (json.dumps(current), job_id)
+            )
+            conn.commit()
 
 def get_job(job_id):
-    with jobs_lock:
-        jobs = _load_jobs()
-        return jobs.get(job_id)
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT data FROM jobs WHERE job_id = %s",
+                (job_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
 
-
+            data = row["data"]
+            if isinstance(data, str):
+                return json.loads(data)
+            return data
 # ============================================================
 # محرك Cohere الأساسي + Deepgram كخط احتياط
 # ============================================================
