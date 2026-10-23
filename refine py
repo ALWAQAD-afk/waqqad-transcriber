@@ -1,61 +1,38 @@
-
 import os
 import requests
 
-# اقرأ المفتاح من متغير البيئة (Render) أو من ملف gemini_key.txt (Termux)
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-if not GEMINI_API_KEY:
-    try:
-        with open("gemini_key.txt", "r", encoding="utf-8") as f:
-            GEMINI_API_KEY = f.read().strip()
-    except:
-        GEMINI_API_KEY = ""
-
-# الموديل الجديد الشغال حالياً - لا تغيره
+# لا نقرأ أي ملف عند الاستيراد - فقط متغير البيئة
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 def refine_arabic_text(raw_text: str) -> str:
     """
-    يأخذ النص الخام من Cohere ويعيد نسخة مصححة إملائياً فقط
+    تصحيح إملائي آمن - لا يكسر السيرفر حتى لو المفتاح غير موجود
     """
     if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY غير موجود")
+        raise RuntimeError("GEMINI_API_KEY غير مضبوط في Render Environment")
 
-    # لا نرسل أكثر من 15000 حرف مرة واحدة
-    text = raw_text[:15000]
+    # قص النص الطويل
+    text = (raw_text or "").strip()[:15000]
+    if not text:
+        raise RuntimeError("النص فارغ")
 
-    prompt = f"""أنت مدقق لغوي عربي محترف. مهمتك:
-1. صحح الأخطاء الإملائية فقط: الهمزات (أ إ آ ء)، التاء المربوطة (ة ه)، الياء والألف المقصورة.
-2. أضف علامات الترقيم المناسبة (، .).
-3. ممنوع تلخيص النص أو حذف أي جملة أو تغيير المعنى.
-4. أعد النص المصحح فقط بدون أي شرح إضافي.
+    prompt = f"""أنت مدقق لغوي عربي. صحح الأخطاء الإملائية فقط (همزات، تاء مربوطة، علامات ترقيم). لا تلخص ولا تغير المعنى. أعد النص المصحح فقط:
 
-النص:
----
 {text}
----
-النص المصحح:
 """
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 8000
-        }
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8000}
     }
 
     r = requests.post(url, json=payload, timeout=90)
     r.raise_for_status()
     data = r.json()
-    
+
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except Exception as e:
-        raise RuntimeError(f"Gemini response parsing failed: {data}")
-
-# اختبار سريع
-if __name__ == "__main__":
-    sample = "السلام عليكم اليوم راح نتكلم عن اهميه الوقت"
-    print(refine_arabic_text(sample))
+        raise RuntimeError(f"Gemini parsing error: {str(data)[:500]}")
