@@ -1312,3 +1312,39 @@ if __name__ == "__main__":
         port=10000
     )
  
+===============================================
+#tests
+from refine import refine_arabic_text
+
+@app.route("/refine/<job_id>", methods=["POST"])
+def refine_job(job_id):
+    job = get_job(job_id)
+    if not job: return jsonify({"error": "Job not found"}), 404
+    
+    # اقرأ النص الخام
+    output_file = job.get("output_file")
+    if not output_file or not os.path.exists(output_file):
+        return jsonify({"error": "File not found"}), 404
+        
+    raw_text = Path(output_file).read_text(encoding="utf-8")
+    
+    try:
+        refined = refine_arabic_text(raw_text)
+        
+        # احفظ النسخة المحسنة
+        refined_file = str(Path(output_file).with_name(Path(output_file).stem + "_refined.txt"))
+        Path(refined_file).write_text(refined, encoding="utf-8")
+        
+        # أرسلها للطالب
+        telegram_user_id = job.get("telegram_user_id")
+        if telegram_user_id:
+            send_transcript_to_telegram(
+                telegram_user_id,
+                Path(refined_file),
+                download_name=Path(refined_file).name,
+                caption="✨ النسخة المحسنة إملائياً"
+            )
+        
+        return jsonify({"status": "ok", "refined": refined[:500]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
