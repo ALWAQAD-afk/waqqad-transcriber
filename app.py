@@ -11,6 +11,17 @@ from pathlib import Path
 from warraq import handle_warraq_update
 from warraq_miniapp import register_warraq_miniapp
 import requests
+
+# --- إضافة التنقيح - آمن لا يكسر البوت ---
+try:
+    from refine import refine_arabic_text
+    REFINE_ENABLED = True
+    print("[REFINE] Module loaded", flush=True)
+except Exception as e:
+    print(f"[REFINE] Disabled: {e}", flush=True)
+    refine_arabic_text = None
+    REFINE_ENABLED = False
+# --- نهاية الإضافة ---
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
@@ -1305,46 +1316,57 @@ def warraq_webhook():
     return jsonify({
         "status": "ok"
     }), 200
+
+
+# ============================================================
+# تنقيح النص - Gemini 3.5
+# ============================================================
+
+@app.route("/refine/<job_id>", methods=["POST"])
+def refine_job(job_id):
+    if not REFINE_ENABLED or refine_arabic_text is None:
+        return jsonify({"error": "Refine disabled - check GEMINI_API_KEY env var"}), 503
+
+    job = get_job(job_id)
+    if job is None:
+        return jsonify({"error": "Job not found"}), 404
+
+    output_file = job.get("output_file")
+    if not output_file or not os.path.exists(output_file):
+        return jsonify({"error": "Output file not found - job may have expired"}), 404
+
+    try:
+        raw_text = Path(output_file).read_text(encoding="utf-8")
+        if not raw_text.strip():
+            return jsonify({"error": "Empty transcript"}), 400
+
+        refined = refine_arabic_text(raw_text)
+
+        refined_path = Path(output_file).with_name(Path(output_file).stem + "_refined.txt")
+        refined_path.write_text(refined, encoding="utf-8")
+
+        telegram_user_id = job.get("telegram_user_id")
+        if telegram_user_id:
+            try:
+                send_transcript_to_telegram(
+                    telegram_user_id,
+                    refined_path,
+                    download_name=refined_path.name,
+                    caption="✨ النسخة المحسنة إملائياً"
+                )
+            except Exception as te:
+                print(f"[REFINE TELEGRAM ERROR] {te}", flush=True)
+
+        return jsonify({"status": "ok", "refined_preview": refined[:800]}), 200
+
+    except Exception as e:
+        print(f"[REFINE ERROR] job {job_id}: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
 
     app.run(
         host="0.0.0.0",
         port=10000
     )
- 
-#===============================================
-#tests
-from refine import refine_arabic_text
-
-@app.route("/refine/<job_id>", methods=["POST"])
-def refine_job(job_id):
-    job = get_job(job_id)
-    if not job: return jsonify({"error": "Job not found"}), 404
-    
-    # اقرأ النص الخام
-    output_file = job.get("output_file")
-    if not output_file or not os.path.exists(output_file):
-        return jsonify({"error": "File not found"}), 404
-        
-    raw_text = Path(output_file).read_text(encoding="utf-8")
-    
-    try:
-        refined = refine_arabic_text(raw_text)
-        
-        # احفظ النسخة المحسنة
-        refined_file = str(Path(output_file).with_name(Path(output_file).stem + "_refined.txt"))
-        Path(refined_file).write_text(refined, encoding="utf-8")
-        
-        # أرسلها للطالب
-        telegram_user_id = job.get("telegram_user_id")
-        if telegram_user_id:
-            send_transcript_to_telegram(
-                telegram_user_id,
-                Path(refined_file),
-                download_name=Path(refined_file).name,
-                caption="✨ النسخة المحسنة إملائياً"
-            )
-        
-        return jsonify({"status": "ok", "refined": refined[:500]})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
