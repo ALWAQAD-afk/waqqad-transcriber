@@ -12,14 +12,17 @@ from warraq import handle_warraq_update
 from warraq_miniapp import register_warraq_miniapp
 import requests
 
-# --- إضافة التنقيح - آمن لا يكسر البوت ---
+# --- إضافة التنقيح v3 - نظام 3 ملفات تلقائي + تقسيم دفعات ---
 try:
-    from refine import refine_arabic_text
+    from refine import refine_arabic_text, refine_conservative, refine_liberal, split_text_smart
     REFINE_ENABLED = True
-    print("[REFINE] Module loaded", flush=True)
+    print("[REFINE] v3 Module loaded - 3 files auto mode", flush=True)
 except Exception as e:
     print(f"[REFINE] Disabled: {e}", flush=True)
     refine_arabic_text = None
+    refine_conservative = None
+    refine_liberal = None
+    split_text_smart = None
     REFINE_ENABLED = False
 # --- نهاية الإضافة ---
 from flask import Flask, request, jsonify, send_file
@@ -490,6 +493,19 @@ def finalize_transcript(job_id, transcript, engine):
 
     log_transcription_success(job_id)
 
+    # --- إطلاق التنقيح التلقائي في الخلفية (لا يوقف الرد) ---
+    if REFINE_ENABLED:
+        try:
+            thread = threading.Thread(
+                target=send_refined_versions_async,
+                args=(job_id, str(output_file)),
+                daemon=True
+            )
+            thread.start()
+            print(f"[AUTO-REFINE] Thread started for job {job_id}", flush=True)
+        except Exception as e:
+            print(f"[AUTO-REFINE] Failed to start thread: {e}", flush=True)
+
 def submit_to_deepgram(job_id, input_file, fallback_reason=None):
     """Deepgram Nova-3: المحرك الاحتياطي، مع callback كما في V3."""
     if not DEEPGRAM_API_KEY:
@@ -949,6 +965,72 @@ def send_transcript_to_telegram(
             "Telegram sendDocument HTTP "
             f"{response.status_code}"
         )
+
+
+
+def send_refined_versions_async(job_id, raw_output_file):
+    """إرسال النسختين المحسنتين تلقائياً مع نظام دفعات"""
+    if not REFINE_ENABLED or refine_conservative is None or refine_liberal is None:
+        print(f"[AUTO-REFINE] Disabled for job {job_id}", flush=True)
+        return
+    
+    try:
+        raw_path = Path(raw_output_file)
+        if not raw_path.exists():
+            print(f"[AUTO-REFINE] Raw file not found {raw_output_file}", flush=True)
+            return
+        
+        raw_text = raw_path.read_text(encoding="utf-8")
+        if len(raw_text.strip()) < 50:
+            print(f"[AUTO-REFINE] Text too short for job {job_id}", flush=True)
+            return
+
+        job = get_job(job_id)
+        telegram_user_id = job.get("telegram_user_id") if job else None
+        if not telegram_user_id:
+            print(f"[AUTO-REFINE] No telegram_user_id for job {job_id}", flush=True)
+            return
+
+        original_name = job.get("original_filename") or "transcription"
+        base_stem = Path(original_name).stem
+
+        # --- النسخة 2: محافظة ---
+        try:
+            print(f"[AUTO-REFINE] Starting conservative for job {job_id} ({len(raw_text)} chars)", flush=True)
+            med_text = refine_conservative(raw_text)
+            med_path = raw_path.with_name(f"{base_stem}_med.txt")
+            med_path.write_text(med_text, encoding="utf-8")
+            
+            send_transcript_to_telegram(
+                telegram_user_id,
+                med_path,
+                download_name=med_path.name,
+                caption="📝 النسخة المحسنة (محافظة)\nتصحيح إملائي فقط - بدون تغيير الكلمات"
+            )
+            print(f"[AUTO-REFINE] Med sent for job {job_id}", flush=True)
+            time.sleep(1)
+        except Exception as e:
+            print(f"[AUTO-REFINE] Med failed job {job_id}: {e}", flush=True)
+
+        # --- النسخة 3: حرة ---
+        try:
+            print(f"[AUTO-REFINE] Starting liberal for job {job_id}", flush=True)
+            well_text = refine_liberal(raw_text)
+            well_path = raw_path.with_name(f"{base_stem}_well.txt")
+            well_path.write_text(well_text, encoding="utf-8")
+            
+            send_transcript_to_telegram(
+                telegram_user_id,
+                well_path,
+                download_name=well_path.name,
+                caption="✨ النسخة المحسنة (محسنة بذكاء)\nترتيب فقرات وعناوين مع الحفاظ على المعنى"
+            )
+            print(f"[AUTO-REFINE] Well sent for job {job_id}", flush=True)
+        except Exception as e:
+            print(f"[AUTO-REFINE] Well failed job {job_id}: {e}", flush=True)
+
+    except Exception as e:
+        print(f"[AUTO-REFINE] Fatal error job {job_id}: {e}", flush=True)
 
 
 # ============================================================
