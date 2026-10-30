@@ -7,6 +7,9 @@ import subprocess
 import shutil
 import re
 import time
+import hmac
+import hashlib
+from urllib.parse import parse_qsl
 from pathlib import Path
 from warraq import handle_warraq_update
 from warraq_miniapp import register_warraq_miniapp
@@ -27,6 +30,7 @@ except Exception as e:
 # --- نهاية الإضافة ---
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from werkzeug.utils import secure_filename
 
 
 app = Flask(__name__)
@@ -36,7 +40,12 @@ CORS(
     app,
     resources={
         r"/*": {
-            "origins": "https://alwaqad-afk.github.io"
+            "origins": "https://alwaqad-afk.github.io",
+            "methods": ["GET", "POST", "OPTIONS"],
+            "allow_headers": [
+                "Content-Type",
+                "X-Telegram-Init-Data",
+            ],
         }
     }
 )
@@ -100,6 +109,109 @@ jobs_lock = threading.Lock()
 SUBMIT_TIMEOUT = 1800
 
 # ============================================================
+# حماية الطلبات: مصادقة تيليجرام + أسرار الويبهوك
+# ============================================================
+
+TELEGRAM_WEBHOOK_SECRET = os.environ.get(
+    "TELEGRAM_WEBHOOK_SECRET", ""
+).strip()
+WARRAQ_WEBHOOK_SECRET = os.environ.get(
+    "WARRAQ_WEBHOOK_SECRET", ""
+).strip()
+TELEGRAM_INITDATA_MAX_AGE = int(
+    os.environ.get("TELEGRAM_INITDATA_MAX_AGE", "86400")
+)
+
+
+def _verify_telegram_init_data(init_data, max_age=None):
+    """التحقق من توقيع Telegram WebApp initData."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN is not configured")
+    if not init_data:
+        raise ValueError("Missing Telegram initData")
+
+    pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+    their_hash = pairs.pop("hash", None)
+    if not their_hash:
+        raise ValueError("Missing Telegram hash")
+
+    data_check_string = "\n".join(
+        f"{key}={pairs[key]}" for key in sorted(pairs)
+    )
+    secret_key = hmac.new(
+        b"WebAppData",
+        TELEGRAM_BOT_TOKEN.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    expected_hash = hmac.new(
+        secret_key,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected_hash, their_hash):
+        raise ValueError("Invalid Telegram signature")
+
+    now = int(time.time())
+    auth_date = int(pairs.get("auth_date", "0") or 0)
+    limit = TELEGRAM_INITDATA_MAX_AGE if max_age is None else max_age
+    if not auth_date or now - auth_date > limit or auth_date - now > 300:
+        raise ValueError("Expired Telegram session")
+
+    user = json.loads(pairs.get("user") or "{}")
+    if not user.get("id"):
+        raise ValueError("Missing Telegram user")
+    return user
+
+
+def _current_telegram_user():
+    return _verify_telegram_init_data(
+        request.headers.get("X-Telegram-Init-Data", "")
+    )
+
+
+def _unauthorized(error):
+    return jsonify({
+        "error": "Unauthorized",
+        "detail": str(error),
+    }), 401
+
+
+def _job_belongs_to(job, user):
+    return (
+        str(job.get("telegram_user_id") or "")
+        == str(user["id"])
+    )
+
+
+def _callback_token(job_id):
+    key = (
+        TELEGRAM_BOT_TOKEN
+        or DEEPGRAM_API_KEY
+        or "waqqad"
+    ).encode("utf-8")
+    return hmac.new(
+        key,
+        f"deepgram:{job_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _verify_callback_token(job_id, token):
+    expected = _callback_token(job_id)
+    return bool(token) and hmac.compare_digest(expected, token)
+
+
+def _webhook_secret_ok(configured):
+    """إذا لم يُضبط السر نسمح مؤقتًا للتوافق مع الإعداد الحالي."""
+    if not configured:
+        return True
+    received = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token", ""
+    )
+    return hmac.compare_digest(received, configured)
+
+# ============================================================
 # تخزين المهام - PostgreSQL (Neon)
 # ============================================================
 
@@ -112,6 +224,18 @@ def get_db_connection():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+def _safe_upload_name(original_name):
+    """اسم ملف آمن مع الحفاظ على امتداده، دون قيود على الامتدادات."""
+    raw = (original_name or "").strip()
+    suffix = Path(raw).suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+        suffix = ""
+    stem = secure_filename(Path(raw).stem)[:80].strip("._")
+    if not stem:
+        stem = f"upload_{uuid.uuid4().hex[:12]}"
+    return f"{stem}{suffix}"
+
 
 def init_db():
     """إنشاء جدول المهام إن لم يكن موجودًا."""
@@ -128,11 +252,58 @@ def init_db():
             conn.commit()
     print("[DB] Jobs table ready", flush=True)
 
+def fail_orphaned_jobs():
+    """المهام التي كانت تعمل قبل إعادة التشغيل لن تكتمل."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE jobs
+                SET data = jsonb_set(
+                        jsonb_set(
+                            jsonb_set(data, '{status}', '"failed"'),
+                            '{stage}', '"error"'
+                        ),
+                        '{error}',
+                        to_jsonb(
+                            'انقطع الاتصال قبل اكتمال المهمة (إعادة تشغيل الخدمة).'::text
+                        )
+                    ),
+                    updated_at = NOW()
+                WHERE data->>'status' IN ('queued', 'processing', 'uploading')
+            """)
+            conn.commit()
+    print("[DB] Orphaned jobs marked as failed", flush=True)
+
+
+def cleanup_stale_workdirs():
+    """حذف مجلدات العمل المؤقتة من تشغيل سابق."""
+    removed = 0
+    for path in Path("/tmp").glob("waqqad_*"):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    if removed:
+        print(f"[CLEANUP] Removed {removed} stale work dirs", flush=True)
+
+
 # تهيئة الجدول عند بدء التشغيل
 try:
     init_db()
+    fail_orphaned_jobs()
 except Exception as e:
     print(f"[DB] Warning: could not initialize table: {e}", flush=True)
+finally:
+    try:
+        cleanup_stale_workdirs()
+    except Exception as e:
+        print(f"[CLEANUP] Warning: {e}", flush=True)
+
+if not TELEGRAM_WEBHOOK_SECRET or not WARRAQ_WEBHOOK_SECRET:
+    print(
+        "[SECURITY] Webhook secrets are not fully configured. "
+        "Set TELEGRAM_WEBHOOK_SECRET and WARRAQ_WEBHOOK_SECRET.",
+        flush=True
+    )
 
 def create_job(job_id, data):
     with get_db_connection() as conn:
@@ -153,7 +324,7 @@ def update_job(job_id, **updates):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT data FROM jobs WHERE job_id = %s",
+                "SELECT data FROM jobs WHERE job_id = %s FOR UPDATE",
                 (job_id,)
             )
             row = cur.fetchone()
@@ -533,7 +704,10 @@ def submit_to_deepgram(job_id, input_file, fallback_reason=None):
             or "audio/mpeg"
         )
 
-        callback_url = f"{BASE_URL}/deepgram-callback/{job_id}"
+        callback_url = (
+            f"{BASE_URL}/deepgram-callback/{job_id}"
+            f"?token={_callback_token(job_id)}"
+        )
         url = "https://api.deepgram.com/v1/listen"
 
         params = {
@@ -1086,14 +1260,12 @@ def transcribe():
 
     uploaded_file = request.files["file"]
 
-    telegram_user_id = request.form.get(
-        "telegram_user_id"
-    )
+    try:
+        tg_user = _current_telegram_user()
+    except ValueError as auth_error:
+        return _unauthorized(auth_error)
 
-    if not telegram_user_id:
-        return jsonify({
-            "error": "Missing Telegram user ID"
-        }), 400
+    telegram_user_id = str(tg_user["id"])
 
     if not uploaded_file.filename:
         return jsonify({
@@ -1117,14 +1289,17 @@ def transcribe():
         exist_ok=True
     )
 
-    input_file = (
-        original_dir
-        / uploaded_file.filename
-    )
+    safe_name = _safe_upload_name(uploaded_file.filename)
+    input_file = (original_dir / safe_name).resolve()
+
+    if original_dir.resolve() not in input_file.parents:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return jsonify({
+            "error": "Invalid filename"
+        }), 400
 
     print(
-        f"[UPLOAD] Saving: "
-        f"{uploaded_file.filename}",
+        f"[UPLOAD] Saving: {safe_name}",
         flush=True
     )
 
@@ -1200,6 +1375,16 @@ def deepgram_callback(job_id):
         f"for job {job_id}",
         flush=True
     )
+
+    if not _verify_callback_token(
+        job_id,
+        request.args.get("token", "")
+    ):
+        print(
+            f"[CALLBACK] Rejected untrusted callback for job {job_id}",
+            flush=True
+        )
+        return jsonify({"error": "forbidden"}), 403
 
     job = get_job(job_id)
 
@@ -1278,9 +1463,14 @@ def deepgram_callback(job_id):
 )
 def job_status(job_id):
 
+    try:
+        tg_user = _current_telegram_user()
+    except ValueError as auth_error:
+        return _unauthorized(auth_error)
+
     job = get_job(job_id)
 
-    if job is None:
+    if job is None or not _job_belongs_to(job, tg_user):
         return jsonify({
             "error": "Job not found"
         }), 404
@@ -1298,9 +1488,14 @@ def job_status(job_id):
 )
 def download_result(job_id):
 
+    try:
+        tg_user = _current_telegram_user()
+    except ValueError as auth_error:
+        return _unauthorized(auth_error)
+
     job = get_job(job_id)
 
-    if job is None:
+    if job is None or not _job_belongs_to(job, tg_user):
         return jsonify({
             "error": "Job not found"
         }), 404
@@ -1340,6 +1535,14 @@ def download_result(job_id):
     methods=["POST"]
 )
 def transcriber_webhook():
+
+    if not _webhook_secret_ok(TELEGRAM_WEBHOOK_SECRET):
+        print(
+            "[TRANSCRIBER WEBHOOK] Rejected: bad secret token",
+            flush=True
+        )
+        return jsonify({"error": "forbidden"}), 403
+
     update = request.get_json(
         force=True,
         silent=True
@@ -1380,6 +1583,13 @@ def transcriber_webhook():
 )
 def warraq_webhook():
 
+    if not _webhook_secret_ok(WARRAQ_WEBHOOK_SECRET):
+        print(
+            "[WARRAQ WEBHOOK] Rejected: bad secret token",
+            flush=True
+        )
+        return jsonify({"error": "forbidden"}), 403
+
     update = request.get_json(
         force=True,
         silent=True
@@ -1409,8 +1619,13 @@ def refine_job(job_id):
     if not REFINE_ENABLED or refine_arabic_text is None:
         return jsonify({"error": "Refine disabled - check GEMINI_API_KEY env var"}), 503
 
+    try:
+        tg_user = _current_telegram_user()
+    except ValueError as auth_error:
+        return _unauthorized(auth_error)
+
     job = get_job(job_id)
-    if job is None:
+    if job is None or not _job_belongs_to(job, tg_user):
         return jsonify({"error": "Job not found"}), 404
 
     output_file = job.get("output_file")

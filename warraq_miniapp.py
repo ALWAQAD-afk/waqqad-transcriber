@@ -27,7 +27,12 @@ from warraq import (
 # Telegram Mini App authentication
 # ============================================================
 
-def _verify_init_data(init_data: str, max_age=86400):
+INIT_DATA_MAX_AGE = int(os.getenv("TELEGRAM_INITDATA_MAX_AGE", "86400"))
+
+
+def _verify_init_data(init_data: str, max_age=None):
+    if max_age is None:
+        max_age = INIT_DATA_MAX_AGE
     if not init_data:
         raise ValueError("Missing Telegram initData")
 
@@ -56,8 +61,13 @@ def _verify_init_data(init_data: str, max_age=86400):
     if not hmac.compare_digest(expected_hash, their_hash):
         raise ValueError("Invalid Telegram signature")
 
+    now = int(time.time())
     auth_date = int(pairs.get("auth_date", "0") or 0)
-    if not auth_date or abs(int(time.time()) - auth_date) > max_age:
+    if (
+        not auth_date
+        or now - auth_date > max_age
+        or auth_date - now > 300
+    ):
         raise ValueError("Expired Telegram session")
 
     user = json.loads(pairs.get("user") or "{}")
