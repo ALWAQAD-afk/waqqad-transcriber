@@ -17,14 +17,23 @@ import requests
 
 # --- إضافة التنقيح v3 - نظام 3 ملفات تلقائي + تقسيم دفعات ---
 try:
-    from refine import refine_arabic_text, refine_conservative, refine_liberal, split_text_smart
+    from refine import (
+        GeminiFatalError,
+        refine_arabic_text,
+        refine_conservative,
+        refine_liberal,
+        refine_document,
+        split_text_smart,
+    )
     REFINE_ENABLED = True
     print("[REFINE] v3 Module loaded - 3 files auto mode", flush=True)
 except Exception as e:
     print(f"[REFINE] Disabled: {e}", flush=True)
+    GeminiFatalError = None
     refine_arabic_text = None
     refine_conservative = None
     refine_liberal = None
+    refine_document = None
     split_text_smart = None
     REFINE_ENABLED = False
 # --- نهاية الإضافة ---
@@ -1142,69 +1151,148 @@ def send_transcript_to_telegram(
 
 
 
+def _refine_failure_hint(exc):
+    """رسالة مبسطة للمستخدم بدل تفاصيل تقنية."""
+    text = str(exc).lower()
+    if "gemini_api_key" in text or "مفتاح" in text:
+        return "سبب: إعداد مفتاح التدقيق غير صحيح."
+    if "حد استخدام" in text or "quota" in text or "429" in text:
+        return "سبب: تم بلوغ حد الاستخدام مؤقتاً. أعد المحاولة بعد قليل."
+    if "غير متاح" in text or "404" in text:
+        return "سبب: موديل التدقيق غير متاح حالياً."
+    return "سبب مؤقت في خدمة التدقيق."
+
+
 def send_refined_versions_async(job_id, raw_output_file):
-    """إرسال النسختين المحسنتين تلقائياً مع نظام دفعات"""
-    if not REFINE_ENABLED or refine_conservative is None or refine_liberal is None:
+    """ينشئ ويرسل النسختين المصححة والمحسنة تلقائياً."""
+    if not REFINE_ENABLED or refine_document is None:
         print(f"[AUTO-REFINE] Disabled for job {job_id}", flush=True)
         return
-    
+
     try:
         raw_path = Path(raw_output_file)
         if not raw_path.exists():
-            print(f"[AUTO-REFINE] Raw file not found {raw_output_file}", flush=True)
-            return
-        
-        raw_text = raw_path.read_text(encoding="utf-8")
-        if len(raw_text.strip()) < 50:
-            print(f"[AUTO-REFINE] Text too short for job {job_id}", flush=True)
+            print(
+                f"[AUTO-REFINE] Raw file not found {raw_output_file}",
+                flush=True
+            )
             return
 
-        job = get_job(job_id)
-        telegram_user_id = job.get("telegram_user_id") if job else None
+        raw_text = raw_path.read_text(encoding="utf-8")
+        if not raw_text.strip():
+            print(f"[AUTO-REFINE] Empty text for job {job_id}", flush=True)
+            return
+
+        job = get_job(job_id) or {}
+        telegram_user_id = job.get("telegram_user_id")
         if not telegram_user_id:
-            print(f"[AUTO-REFINE] No telegram_user_id for job {job_id}", flush=True)
+            print(
+                f"[AUTO-REFINE] No telegram_user_id for job {job_id}",
+                flush=True
+            )
             return
 
         original_name = job.get("original_filename") or "transcription"
         base_stem = Path(original_name).stem
 
-        # --- النسخة 2: محافظة ---
-        try:
-            print(f"[AUTO-REFINE] Starting conservative for job {job_id} ({len(raw_text)} chars)", flush=True)
-            med_text = refine_conservative(raw_text)
-            med_path = raw_path.with_name(f"{base_stem}_med.txt")
-            med_path.write_text(med_text, encoding="utf-8")
-            
-            send_transcript_to_telegram(
-                telegram_user_id,
-                med_path,
-                download_name=med_path.name,
-                caption="📝 النسخة المحسنة (محافظة)\nتصحيح إملائي فقط - بدون تغيير الكلمات"
-            )
-            print(f"[AUTO-REFINE] Med sent for job {job_id}", flush=True)
-            time.sleep(1)
-        except Exception as e:
-            print(f"[AUTO-REFINE] Med failed job {job_id}: {e}", flush=True)
-
-        # --- النسخة 3: حرة ---
-        try:
-            print(f"[AUTO-REFINE] Starting liberal for job {job_id}", flush=True)
-            well_text = refine_liberal(raw_text)
-            well_path = raw_path.with_name(f"{base_stem}_well.txt")
-            well_path.write_text(well_text, encoding="utf-8")
-            
-            send_transcript_to_telegram(
-                telegram_user_id,
-                well_path,
-                download_name=well_path.name,
-                caption="✨ النسخة المحسنة (محسنة بذكاء)\nترتيب فقرات وعناوين مع الحفاظ على المعنى"
-            )
-            print(f"[AUTO-REFINE] Well sent for job {job_id}", flush=True)
-        except Exception as e:
-            print(f"[AUTO-REFINE] Well failed job {job_id}: {e}", flush=True)
-
     except Exception as e:
-        print(f"[AUTO-REFINE] Fatal error job {job_id}: {e}", flush=True)
+        print(
+            f"[AUTO-REFINE] Fatal setup error job {job_id}: {e}",
+            flush=True
+        )
+        return
+
+    try:
+        telegram_send_message(
+            telegram_user_id,
+            "✅ تم استخراج النص الخام.\n"
+            "⏳ جارٍ الآن تجهيز نسختين إضافيتين: "
+            "مصححة إملائياً، ومحسّنة للقراءة.\n"
+            "قد يستغرق الأمر بضع دقائق حسب طول الملف."
+        )
+    except Exception as e:
+        print(f"[AUTO-REFINE] Status message failed: {e}", flush=True)
+
+    versions = [
+        (
+            "conservative",
+            "_med.txt",
+            "📝 النسخة المصححة إملائياً\n"
+            "تصحيح الهمزات والترقيم فقط دون تغيير الكلمات.",
+        ),
+        (
+            "liberal",
+            "_well.txt",
+            "✨ النسخة المحسّنة\n"
+            "ترتيب الفقرات والعناوين مع الحفاظ على المعنى.",
+        ),
+    ]
+
+    for mode, suffix, caption in versions:
+        try:
+            print(
+                f"[AUTO-REFINE] Starting {mode} for job {job_id} "
+                f"({len(raw_text)} chars)",
+                flush=True
+            )
+
+            result = refine_document(raw_text, mode)
+            text = (result.get("text") or "").strip()
+            if not text:
+                raise RuntimeError("الناتج فارغ")
+
+            refined_path = raw_path.with_name(f"{base_stem}{suffix}")
+            refined_path.write_text(text, encoding="utf-8")
+
+            send_transcript_to_telegram(
+                telegram_user_id,
+                refined_path,
+                download_name=refined_path.name,
+                caption=caption
+            )
+            print(
+                f"[AUTO-REFINE] {mode} sent for job {job_id}",
+                flush=True
+            )
+
+            fallbacks = int(result.get("fallbacks") or 0)
+            chunks = int(result.get("chunks") or 0)
+            if fallbacks:
+                telegram_send_message(
+                    telegram_user_id,
+                    "⚠️ ملاحظة: تعذر تدقيق "
+                    f"{fallbacks} من أصل {chunks} أجزاء في هذه النسخة، "
+                    "فأُعيد النص الأصلي لها دون تغيير."
+                )
+
+        except Exception as e:
+            print(
+                f"[AUTO-REFINE] {mode} failed job {job_id}: "
+                f"{type(e).__name__}: {e}",
+                flush=True
+            )
+            label = (
+                "المصححة إملائياً"
+                if mode == "conservative"
+                else "المحسّنة"
+            )
+            try:
+                telegram_send_message(
+                    telegram_user_id,
+                    f"❌ تعذر إنشاء النسخة {label}.\n"
+                    f"{_refine_failure_hint(e)}\n"
+                    "النسخة الخام وصلتك سليمة ويمكنك استخدامها."
+                )
+            except Exception:
+                pass
+
+            if GeminiFatalError and isinstance(e, GeminiFatalError):
+                print(
+                    f"[AUTO-REFINE] Fatal error, skipping remaining "
+                    f"versions for job {job_id}",
+                    flush=True
+                )
+                break
 
 
 # ============================================================
