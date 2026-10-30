@@ -3,6 +3,8 @@ import re
 import time
 import random
 import difflib
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -28,6 +30,9 @@ REFINE_REQUEST_GAP = float(os.environ.get("REFINE_REQUEST_GAP", "1.0"))
 REFINE_THINKING_LEVEL = os.environ.get(
     "REFINE_THINKING_LEVEL", "minimal"
 ).strip() or "minimal"
+REFINE_CONCURRENCY = max(
+    1, int(os.environ.get("REFINE_CONCURRENCY", "3"))
+)
 
 
 class GeminiError(RuntimeError):
@@ -196,6 +201,10 @@ CONSERVATIVE_PROMPT = """أنت مدقق إملائي عربي محافظ. مه�
 - حذف أو إضافة أي جملة أو معلومة.
 - إضافة تشكيل أو شرح أو عناوين أو ترقيم قوائم.
 - تغيير الأسماء أو الأرقام أو الآيات أو الأحاديث أو الشعر أو الأمثال.
+- إضافة أسماء إنجليزية أو اختصارات أو أرقام أو تواريخ غير موجودة حرفياً.
+- استبدال كلمة عربية بأخرى، أو ترجمة أي اسم أو مصطلح.
+
+إذا ورد شعر أو بيت أو نص موزون: انقله كما هو، ولا تحوله إلى نثر، ولا تعيد ترتيب الشطرين، وحافظ على فواصل الأسطر.
 
 حافظ على فواصل الأسطر والفقرات كما هي.
 أعد النص المصحح فقط، دون أي مقدمة أو خاتمة أو أسوار كود.
@@ -220,8 +229,13 @@ FULL_PROMPT = """أنت محرر عربي محترف لنصوص المحاضرا
 - تغيير المعنى أو الأسماء أو الأرقام أو المصطلحات.
 - الترجمة أو إضافة شرح أو تعليق.
 - اختلاق عناوين لا يعكسها النص.
+- إضافة أسماء إنجليزية أو اختصارات أو أرقام أو تواريخ أو شرح غير موجود.
+- ترجمة الأسماء أو المصطلحات أو كتابة مقابلها الأجنبي.
+- إعادة صياغة الشعر أو تحويله إلى نثر أو دمج شطرين.
 
-حافظ على كل المحتوى.
+إذا ورد شعر أو بيت أو نص موزون: اتركه حرفياً في فقرة مستقلة، دون إعادة صياغة أو تقطيع أو إضافة عنوان أو شرح.
+
+حافظ على كل المحتوى والأرقام والأسماء كما هي.
 أعد النص النهائي فقط، دون مقدمات أو أسوار كود.
 
 النص:
@@ -230,6 +244,34 @@ FULL_PROMPT = """أنت محرر عربي محترف لنصوص المحاضرا
 ---
 
 النص المحسن:"""
+
+POETRY_PROMPT = """أنت ناسخ أمين لنص يحتوي شعراً أو نصاً موزوناً. مهمتك تصحيح الإملاء والهمزات والترقيم فقط دون أي تغيير في الألفاظ.
+
+الممنوع منعاً باتاً:
+- تغيير أي كلمة أو استبدالها.
+- إعادة ترتيب الشطرين أو دمجهما أو تفريقهما.
+- تحويل الشعر إلى نثر أو إضافة عنوان أو شرح.
+- إضافة تشكيل أو أسماء أو أرقام غير موجودة.
+
+حافظ على فواصل الأسطر كما وردت.
+أعد النص فقط دون مقدمة أو خاتمة أو أسوار كود.
+
+النص:
+---
+{chunk}
+---
+
+النص المصحح:"""
+
+POETRY_CUES = re.compile(
+    r"(قال\s+الشاعر|يقول\s+الشاعر|أنشد|قصيدة|أبيات|بيت\s+شعر"
+    r"|شطر|ديوان|مطلع|قافية|بحر\s+الشعر|الشعر\s+العربي)"
+)
+
+
+def _looks_like_poetry(text):
+    return bool(POETRY_CUES.search(text or ""))
+
 
 STRICT_SUFFIX = """
 
@@ -242,7 +284,11 @@ STRICT_SUFFIX = """
 
 
 def _build_prompt(chunk, mode, strict=False):
-    template = FULL_PROMPT if mode == "liberal" else CONSERVATIVE_PROMPT
+    if _looks_like_poetry(chunk):
+        template = POETRY_PROMPT
+    else:
+        template = FULL_PROMPT if mode == "liberal" else CONSERVATIVE_PROMPT
+
     prompt = template.format(chunk=chunk)
     if strict:
         prompt += STRICT_SUFFIX
@@ -472,13 +518,53 @@ def _post_gemini(prompt, chunk, mode):
     )
 
 
+_DIGITS = str.maketrans(
+    "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹",
+    "01234567890123456789",
+)
+_PERSIAN_LETTERS = "پچژگکی"
+
+
+def _content_signature(text):
+    normalized = (text or "").translate(_DIGITS)
+    numbers = [
+        re.sub(r"[,٬.]", "", token)
+        for token in re.findall(r"\d[\d,٬.]*", normalized)
+    ]
+    return (
+        Counter(numbers),
+        Counter(
+            word.lower()
+            for word in re.findall(
+                r"[A-Za-z][A-Za-z0-9+.#_-]*", text or ""
+            )
+        ),
+        Counter(ch for ch in (text or "") if ch in _PERSIAN_LETTERS),
+    )
+
+
+def _preserves_content(src, output):
+    src_numbers, src_latin, src_persian = _content_signature(src)
+    out_numbers, out_latin, out_persian = _content_signature(output)
+
+    if src_numbers != out_numbers:
+        return False
+    if src_latin != out_latin:
+        return False
+    if out_persian - src_persian:
+        return False
+    return True
+
+
 def _is_valid(src, output, mode):
     if not output or not output.strip():
+        return False
+    if not _preserves_content(src, output):
         return False
 
     ratio = len(output) / max(1, len(src))
 
-    if mode == "conservative":
+    if mode == "conservative" or _looks_like_poetry(src):
         if not 0.6 <= ratio <= 1.5:
             return False
 
@@ -524,6 +610,46 @@ def _refine_block(chunk, mode, strict=False):
 # الواجهة العامة
 # ============================================================
 
+_PERSIAN_REPAIRS = {
+    "ی": "ي",
+    "ک": "ك",
+    "پ": "ب",
+    "چ": "ج",
+    "ژ": "ز",
+    "گ": "ك",
+}
+
+
+def _repair_common_chars(src, output):
+    for bad, good in _PERSIAN_REPAIRS.items():
+        if bad not in src:
+            output = output.replace(bad, good)
+    return output
+
+
+def _refine_chunk(chunk, mode):
+    result = _repair_common_chars(chunk, _refine_block(chunk, mode))
+
+    if not _is_valid(chunk, result, mode):
+        result = _repair_common_chars(
+            chunk, _refine_block(chunk, mode, strict=True)
+        )
+
+    if not _is_valid(chunk, result, mode):
+        raise GeminiError("لم يجتز الناتج فحص الجودة")
+
+    return result
+
+
+def _refine_chunk_safe(index, chunk, mode):
+    try:
+        return index, _refine_chunk(chunk, mode), None
+    except GeminiFatalError:
+        raise
+    except Exception as exc:
+        return index, chunk, exc
+
+
 def refine_document(raw_text, mode="conservative"):
     """
     يدقق النص كاملاً ويعيد:
@@ -547,38 +673,51 @@ def refine_document(raw_text, mode="conservative"):
         }
 
     chunks = split_text_smart(raw_text)
+    results = [None] * len(chunks)
+    workers = min(REFINE_CONCURRENCY, len(chunks))
+
+    if workers <= 1:
+        for index, chunk in enumerate(chunks, start=1):
+            results[index - 1] = _refine_chunk_safe(index, chunk, mode)
+
+            print(
+                f"[REFINE {mode}] {index}/{len(chunks)} "
+                f"({len(chunk)} chars)",
+                flush=True,
+            )
+
+            if index < len(chunks) and REFINE_REQUEST_GAP > 0:
+                time.sleep(REFINE_REQUEST_GAP)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_refine_chunk_safe, index, chunk, mode): index
+                for index, chunk in enumerate(chunks, start=1)
+            }
+
+            try:
+                for future in as_completed(futures):
+                    index, text, error = future.result()
+                    results[index - 1] = (index, text, error)
+                    print(
+                        f"[REFINE {mode}] {index}/{len(chunks)} done",
+                        flush=True,
+                    )
+            except GeminiFatalError:
+                for future in futures:
+                    future.cancel()
+                raise
+
     refined_parts = []
     issues = []
     fallbacks = 0
 
-    for index, chunk in enumerate(chunks, start=1):
-        try:
-            result = _refine_block(chunk, mode)
-
-            if not _is_valid(chunk, result, mode):
-                result = _refine_block(chunk, mode, strict=True)
-
-            if not _is_valid(chunk, result, mode):
-                raise GeminiError("لم يجتز الناتج فحص الجودة")
-
-        except GeminiFatalError:
-            raise
-
-        except Exception as exc:
+    for index, text, error in results:
+        if error is not None:
             fallbacks += 1
-            issues.append(f"الجزء {index}/{len(chunks)}: {exc}")
-            result = chunk
-
-        refined_parts.append(result)
-
-        print(
-            f"[REFINE {mode}] {index}/{len(chunks)} "
-            f"({len(chunk)} chars)",
-            flush=True,
-        )
-
-        if index < len(chunks) and REFINE_REQUEST_GAP > 0:
-            time.sleep(REFINE_REQUEST_GAP)
+            issues.append(f"الجزء {index}/{len(chunks)}: {error}")
+            text = chunks[index - 1]
+        refined_parts.append(text)
 
     return {
         "text": "\n\n".join(refined_parts),
