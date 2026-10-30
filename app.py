@@ -85,6 +85,23 @@ COHERE_SEGMENT_SECONDS = 7200
 COHERE_MAX_FILE_BYTES = 24_000_000
 COHERE_TIMEOUT = 1800
 
+# الصيغ التي يقبلها Cohere مباشرة دون تحويل.
+COHERE_DIRECT_EXTENSIONS = {
+    ".flac",
+    ".mp3",
+    ".mpeg",
+    ".mpga",
+    ".ogg",
+    ".wav",
+}
+
+# MP3 يمكن تقطيعه بنسخ الضغط دون إعادة ترميز (أسرع بكثير).
+COHERE_COPY_EXTENSIONS = {
+    ".mp3",
+    ".mpeg",
+    ".mpga",
+}
+
 # توزيع الطلبات على عدد غير محدود من المفاتيح (Round-robin).
 cohere_key_lock = threading.Lock()
 cohere_key_cursor = 0
@@ -376,13 +393,75 @@ def get_job(job_id):
 # محرك Cohere الأساسي + Deepgram كخط احتياط
 # ============================================================
 
+def _audio_content_type(path):
+    suffix = Path(path).suffix.lower()
+    if suffix == ".wav":
+        return "audio/wav"
+    if suffix == ".ogg":
+        return "audio/ogg"
+    if suffix == ".flac":
+        return "audio/flac"
+    return "audio/mpeg"
+
+
+def _probe_audio_duration(path):
+    """مدة الملف بالثواني عبر ffprobe، أو None إذا تعذر."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0:
+            duration = float(result.stdout.strip())
+            if duration > 0:
+                return duration
+    except Exception as e:
+        print(f"[COHERE] ffprobe failed: {e}", flush=True)
+
+    return None
+
+
+def _run_ffmpeg(cmd, job_id):
+    print(
+        f"[COHERE] Running ffmpeg for job {job_id}...",
+        flush=True
+    )
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "FFmpeg failed: "
+            + (result.stderr[-1500:] or "unknown error")
+        )
+
+
+def _clean_parts_dir(parts_dir):
+    shutil.rmtree(parts_dir, ignore_errors=True)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+
 def prepare_cohere_parts(job_id, input_file):
-    """تحويل أي مدخل إلى MP3 mono 16kHz/24kbps وتقسيمه إلى قطع ساعتين."""
+    """يجهّز قطع Cohere بأسرع مسار ممكن دون تغيير النص أو الصوت."""
     work_dir = Path("/tmp") / f"waqqad_{job_id}"
     parts_dir = work_dir / "cohere_parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
 
     output_pattern = parts_dir / "part_%03d.mp3"
+    suffix = input_file.suffix.lower()
+    file_size = input_file.stat().st_size
 
     update_job(
         job_id,
@@ -391,6 +470,85 @@ def prepare_cohere_parts(job_id, input_file):
         engine="cohere"
     )
 
+    # 1) ملف صغير بصيغة مدعومة: يُرسل كما هو دون أي تفريغ أو تحويل.
+    if (
+        file_size <= COHERE_MAX_FILE_BYTES
+        and suffix in COHERE_DIRECT_EXTENSIONS
+    ):
+        print(
+            f"[COHERE] Direct upload for job {job_id} "
+            f"({file_size / 1_000_000:.2f}MB, {suffix or 'no ext'})",
+            flush=True
+        )
+        update_job(
+            job_id,
+            total_parts=1,
+            prepare_mode="direct"
+        )
+        return [input_file]
+
+    # 2) MP3 كبير: تقطيع بنسخ الضغط دون إعادة ترميز (سريع جداً).
+    duration = None
+    if suffix in COHERE_COPY_EXTENSIONS:
+        duration = _probe_audio_duration(input_file)
+
+    if duration:
+        target_seconds = int(
+            (COHERE_MAX_FILE_BYTES * 0.90 / file_size) * duration
+        )
+        target_seconds = max(60, target_seconds)
+
+        copy_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-i", str(input_file),
+            "-vn",
+            "-map", "0:a:0",
+            "-c:a", "copy",
+            "-f", "segment",
+            "-segment_time", str(target_seconds),
+            "-reset_timestamps", "1",
+            str(output_pattern),
+        ]
+
+        try:
+            _run_ffmpeg(copy_cmd, job_id)
+            parts = sorted(parts_dir.glob("part_*.mp3"))
+            oversized = [
+                p for p in parts
+                if p.stat().st_size > COHERE_MAX_FILE_BYTES
+            ]
+            if parts and not oversized:
+                print(
+                    f"[COHERE] Fast-split job {job_id} into "
+                    f"{len(parts)} part(s) without re-encoding",
+                    flush=True
+                )
+                update_job(
+                    job_id,
+                    total_parts=len(parts),
+                    prepare_mode="copy"
+                )
+                return parts
+
+            print(
+                f"[COHERE] Copy split unusable for job {job_id} "
+                f"(parts={len(parts)}, oversized={len(oversized)}); "
+                "falling back to re-encode",
+                flush=True
+            )
+        except Exception as e:
+            print(
+                f"[COHERE] Copy split failed for job {job_id}: {e}; "
+                "falling back to re-encode",
+                flush=True
+            )
+
+        _clean_parts_dir(parts_dir)
+
+    # 3) المسار الموثوق: تحويل وضغط وتقسيم في مرور واحد.
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -408,22 +566,7 @@ def prepare_cohere_parts(job_id, input_file):
         str(output_pattern),
     ]
 
-    print(
-        f"[COHERE] Preparing audio for job {job_id}...",
-        flush=True
-    )
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            "FFmpeg failed: "
-            + (result.stderr[-1500:] or "unknown error")
-        )
+    _run_ffmpeg(cmd, job_id)
 
     parts = sorted(parts_dir.glob("part_*.mp3"))
 
@@ -453,6 +596,11 @@ def prepare_cohere_parts(job_id, input_file):
         flush=True
     )
 
+    update_job(
+        job_id,
+        total_parts=len(parts),
+        prepare_mode="reencode"
+    )
     return parts
 
 
@@ -533,7 +681,7 @@ def cohere_transcribe_part(job_id, part, part_index, part_count):
                         "file": (
                             part.name,
                             audio,
-                            "audio/mpeg"
+                            _audio_content_type(part)
                         )
                     },
                     timeout=COHERE_TIMEOUT
