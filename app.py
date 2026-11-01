@@ -41,6 +41,22 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
+# --- الاستقبال المباشر، التصدير، والطابور ---
+import job_queue
+import transcripts as transcript_store
+from bot_upload import (
+    DownloadFailed,
+    FileTooLarge,
+    MAX_UPLOAD_BYTES,
+    UnsupportedFile,
+    download_telegram_file,
+    extract_attachment,
+    human_size as format_size,
+    is_supported,
+)
+from exporters import DOCX_MIME, TXT_MIME, build_docx, build_txt
+# --- نهاية الإضافة ---
+
 
 app = Flask(__name__)
 register_warraq_miniapp(app)
@@ -324,6 +340,16 @@ finally:
     except Exception as e:
         print(f"[CLEANUP] Warning: {e}", flush=True)
 
+# جدول النصوص: أساس التصدير والبحث والأرشيف
+try:
+    if transcript_store.init_table():
+        print("[DB] Transcripts table ready", flush=True)
+except Exception as e:
+    print(
+        f"[DB] Warning: could not initialize transcripts table: {e}",
+        flush=True
+    )
+
 if not TELEGRAM_WEBHOOK_SECRET or not WARRAQ_WEBHOOK_SECRET:
     print(
         "[SECURITY] Webhook secrets are not fully configured. "
@@ -389,6 +415,41 @@ def get_job(job_id):
             if isinstance(data, str):
                 return json.loads(data)
             return data
+
+
+def new_job_payload(
+    job_id,
+    original_filename,
+    file_size,
+    telegram_user_id,
+    source="web"
+):
+    """بنية موحّدة للمهمة، سواء جاءت من الويب أو من المحادثة."""
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "stage": "queued",
+        "error": None,
+        "output_file": None,
+        "original_filename": original_filename,
+        "file_size_bytes": file_size,
+        "started_at": time.time(),
+        "completed_at": None,
+        "processing_seconds": None,
+        "deepgram_request_id": None,
+        "engine": None,
+        "fallback_used": False,
+        "fallback_reason": None,
+        "cohere_key_index": None,
+        "cohere_keys_used": [],
+        "current_part": None,
+        "total_parts": None,
+        "telegram_user_id": telegram_user_id,
+        "telegram_sent": False,
+        "telegram_error": None,
+        "source": source,
+    }
+
 # ============================================================
 # محرك Cohere الأساسي + Deepgram كخط احتياط
 # ============================================================
@@ -788,13 +849,43 @@ def finalize_transcript(job_id, transcript, engine):
         processing_seconds=processing_seconds
     )
 
+    # حفظ النص في قاعدة البيانات: أساس البحث والتصدير عند الطلب.
+    transcript_store.save_transcript(
+        job_id,
+        telegram_user_id,
+        "raw",
+        transcript,
+        title=Path(original_filename).stem or None,
+        duration_secs=(
+            job.get("duration_seconds")
+            or job.get("audio_duration_seconds")
+        )
+    )
+
+    _archive_transcript(
+        job_id,
+        transcript,
+        {**job, "output_name": download_name}
+    )
+
+    keyboard = _result_keyboard(
+        job_id,
+        transcript_store.available_kinds(job_id) or {"raw"}
+    )
+
+    caption = (
+        caption
+        + "\n\n💾 محفوظ في أرشيفك — /find للبحث عنه لاحقًا."
+    )
+
     try:
         if telegram_user_id:
             send_transcript_to_telegram(
                 telegram_user_id,
                 output_file,
                 download_name=download_name,
-                caption=caption
+                caption=caption,
+                reply_markup=keyboard
             )
             telegram_sent = True
             telegram_error = None
@@ -1202,7 +1293,7 @@ def log_transcription_failure(job_id):
 
 
 def handle_transcriber_chat_update(update):
-    """Reply only to /start and /help; ordinary messages are ignored."""
+    """الملفات تُفرّغ مباشرة، والأوامر تُخدم، وغير ذلك يُتجاهل بهدوء."""
     message = update.get("message")
     if not message:
         return
@@ -1213,17 +1304,35 @@ def handle_transcriber_chat_update(update):
     if not chat_id or sender.get("is_bot"):
         return
 
-    raw_text = (message.get("text") or "").strip()
-    if not raw_text.startswith("/"):
-        print(
-            f"[TRANSCRIBER CHAT] Ignored ordinary message from chat_id={chat_id}",
-            flush=True
-        )
+    user_id = sender.get("id")
+
+    attachment = extract_attachment(message)
+    if attachment:
+        handle_bot_attachment(chat, sender, attachment)
         return
 
-    command = raw_text.split(None, 1)[0].split("@", 1)[0].lower()
-    if command not in {"/start", "/help"}:
+    raw_text = (message.get("text") or "").strip()
+    if not raw_text.startswith("/"):
+        if chat.get("type") == "private" and (
+            raw_text or message.get("photo") or message.get("sticker")
+        ):
+            telegram_send_message(
+                chat_id,
+                "🎧 أرسل ملفاً صوتياً أو محاضرة، وسأفرّغها هنا مباشرة.\n"
+                "🔍 للبحث في تفريغاتك: /find\n"
+                "❓ لمعرفة الأوامر: /help"
+            )
+        else:
+            print(
+                f"[TRANSCRIBER CHAT] Ignored ordinary message "
+                f"from chat_id={chat_id}",
+                flush=True
+            )
         return
+
+    command, _, argument = raw_text.partition(" ")
+    command = command.split("@", 1)[0].lower()
+    argument = argument.strip()
 
     keyboard = {
         "inline_keyboard": [[{
@@ -1235,19 +1344,231 @@ def handle_transcriber_chat_update(update):
     if command == "/start":
         reply = (
             "أهلًا بك في مفرّغ الوقّاد 🎙️\n\n"
-            "افتح مفرّغ النصوص من الزر أدناه، ثم اختر ملفك الصوتي. "
-            "ستصل النتيجة إلى هذه المحادثة فور اكتمالها."
+            "أرسل ملفاً صوتياً أو محاضرة في هذه المحادثة، "
+            "وسأعيد لك التفريغ هنا.\n\n"
+            "• حتى 20MB يُفرّغ مباشرة.\n"
+            "• الأكبر من ذلك من صفحة الرفع.\n"
+            "• /find للبحث في تفريغاتك السابقة."
         )
-    else:
+    elif command == "/help":
         reply = (
-            "🎙️ لاستخدام مفرّغ الوقّاد:\n"
-            "1) افتح مفرّغ النصوص من الزر أدناه.\n"
-            "2) اختر الملف الصوتي وابدأ التفريغ.\n"
-            "3) بعد تأكيد استلام الملف يمكنك إغلاق الصفحة؛ "
-            "وستصل النتيجة هنا عند اكتمالها."
+            "🎙️ كيف تستخدم مفرّغ الوقّاد:\n"
+            "1) أرسل الملف الصوتي أو الفيديو في هذه المحادثة.\n"
+            "2) انتظر، وستصلك النسخة الخام ثم المصححة والمحسّنة.\n"
+            "3) نزّل DOCX أو TXT من الأزرار أسفل النتيجة.\n\n"
+            "🔍 /find كلمة — البحث في تفريغاتك.\n"
+            "🔍 /find — آخر تفريغاتك.\n"
+            "🗂️ كل تفريغ يُحفظ في أرشيفك الخاص.\n\n"
+            "الملفات الأكبر من 20MB تُرفع من صفحة الرفع أدناه."
         )
+    elif command == "/find":
+        handle_find(chat_id, user_id, argument)
+        return
+    else:
+        telegram_send_message(
+            chat_id,
+            "أمر غير معروف.\n/help لعرض الأوامر المتاحة."
+        )
+        return
 
     telegram_send_message(chat_id, reply, reply_markup=keyboard)
+
+
+def handle_bot_attachment(chat, sender, attachment):
+    """ملف وصل إلى البوت: تحقّق، ثم مهمة في الطابور."""
+    chat_id = chat.get("id")
+    user_id = sender.get("id")
+
+    if chat.get("type") != "private":
+        telegram_send_message(
+            chat_id,
+            "أرسل الملف في محادثة خاصة معي، حتى تبقى النتيجة لك وحدك."
+        )
+        return
+
+    if not is_supported(attachment):
+        telegram_send_message(
+            chat_id,
+            "هذا الملف ليس صوتاً ولا فيديو.\n"
+            "أرسل المحاضرة بصيغة mp3 أو m4a أو ogg أو wav، "
+            "أو أرسلها فيديو."
+        )
+        return
+
+    size = int(attachment.get("file_size") or 0)
+    if size > MAX_UPLOAD_BYTES:
+        limit_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+        telegram_send_message(
+            chat_id,
+            f"⚠️ حجم الملف {format_size(size)}، وتليجرام لا يسمح "
+            f"للبوت بتنزيل أكثر من {limit_mb}MB.\n\n"
+            "ارفعه من صفحة الرفع، وستصل النتيجة إلى هذه المحادثة:",
+            reply_markup={
+                "inline_keyboard": [[{
+                    "text": "📤 فتح صفحة الرفع",
+                    "web_app": {"url": TRANSCRIBER_WEBAPP_URL}
+                }]]
+            }
+        )
+        return
+
+    job_id = str(uuid.uuid4())
+    original_dir = Path("/tmp") / f"waqqad_{job_id}" / "original"
+    original_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = _safe_upload_name(attachment.get("file_name"))
+    destination = (original_dir / safe_name).resolve()
+
+    create_job(
+        job_id,
+        new_job_payload(
+            job_id,
+            attachment.get("file_name") or safe_name,
+            size,
+            str(user_id),
+            source="bot"
+        )
+    )
+
+    position = job_queue.enqueue(
+        job_id,
+        run_bot_job,
+        job_id,
+        attachment,
+        destination
+    )
+
+    queue_note = (
+        f"⏳ ترتيبك في الطابور: {position}"
+        if position > 1
+        else "⚡ سأبدأ به الآن."
+    )
+
+    telegram_send_message(
+        chat_id,
+        f"📥 وصلني: {attachment.get('file_name')}\n"
+        f"📦 الحجم: {format_size(size)}\n"
+        f"{queue_note}\n\n"
+        "يمكنك إغلاق المحادثة، وستصل النتيجة هنا."
+    )
+
+
+def run_bot_job(job_id, attachment, destination):
+    """يعمل داخل عامل الطابور: تنزيل الملف ثم تفريغه."""
+    job = get_job(job_id) or {}
+    telegram_user_id = job.get("telegram_user_id")
+
+    try:
+        update_job(job_id, stage="downloading")
+        size = download_telegram_file(
+            TELEGRAM_BOT_TOKEN,
+            attachment.get("file_id"),
+            destination,
+            MAX_UPLOAD_BYTES
+        )
+
+        update_job(job_id, stage="processing", file_size_bytes=size)
+
+        if telegram_user_id:
+            telegram_send_message(
+                telegram_user_id,
+                f"⬇️ تم التنزيل ({format_size(size)}).\n"
+                "🎧 بدأ التفريغ الآن، وسأرسل النص عند اكتماله."
+            )
+
+        process_transcription_job(job_id, destination)
+
+    except FileTooLarge as e:
+        update_job(
+            job_id,
+            status="failed",
+            stage="error",
+            error=f"file too large: {e}"
+        )
+        log_transcription_failure(job_id)
+        if telegram_user_id:
+            telegram_send_message(
+                telegram_user_id,
+                "⚠️ تجاوز الملف الحد المسموح للتنزيل.\n"
+                "ارفعه من صفحة الرفع، وستصل النتيجة هنا."
+            )
+
+    except (DownloadFailed, UnsupportedFile) as e:
+        update_job(
+            job_id,
+            status="failed",
+            stage="error",
+            error=f"download failed: {e}"
+        )
+        log_transcription_failure(job_id)
+        if telegram_user_id:
+            telegram_send_message(
+                telegram_user_id,
+                "❌ تعذّر تنزيل الملف من تليجرام. أعد إرساله، "
+                "أو ارفعه من صفحة الرفع."
+            )
+
+    except Exception as e:
+        print(
+            f"[BOT JOB ERROR] {job_id}: {type(e).__name__}: {e}",
+            flush=True
+        )
+        update_job(
+            job_id,
+            status="failed",
+            stage="error",
+            error=str(e)
+        )
+        log_transcription_failure(job_id)
+        if telegram_user_id:
+            telegram_send_message(
+                telegram_user_id,
+                "❌ حدث خطأ غير متوقع أثناء تجهيز الملف.\n"
+                "أعد المحاولة، وإن تكرر فأبلغنا."
+            )
+
+
+def handle_find(chat_id, user_id, query):
+    """البحث في تفريغات المستخدم، محصورًا به وحده."""
+    rows = transcript_store.search_transcripts(user_id, query, limit=8)
+
+    if not rows:
+        if query:
+            telegram_send_message(
+                chat_id,
+                f"🔍 لا نتائج عن «{query}».\n"
+                "جرّب كلمة أقصر أو جزءًا منها."
+            )
+        else:
+            telegram_send_message(
+                chat_id,
+                "📭 لا يوجد تفريغ محفوظ بعد.\n"
+                "أرسل ملفاً صوتياً وسأحفظه لك."
+            )
+        return
+
+    header = (
+        f"🔍 نتائج «{query}»:" if query else "🗂️ آخر تفريغاتك:"
+    )
+    lines = [header]
+    keyboard = []
+
+    for index, row in enumerate(rows, start=1):
+        title = row.get("title") or "تفريغ"
+        created = row.get("created_at")
+        when = created.strftime("%Y-%m-%d") if created else ""
+        lines.append(
+            f"{index}. {title} — {when} — {row.get('chars') or 0} حرف"
+        )
+        keyboard.append([{
+            "text": f"📄 {index}. {title[:40]}",
+            "callback_data": f"f:{row['job_id']}:raw:txt"
+        }])
+
+    telegram_send_message(
+        chat_id,
+        "\n".join(lines),
+        reply_markup={"inline_keyboard": keyboard}
+    )
 
 
 # ============================================================
@@ -1258,7 +1579,8 @@ def send_transcript_to_telegram(
     telegram_user_id,
     output_file,
     download_name="transcription.txt",
-    caption="✅ اكتمل تفريغ الملف بنجاح."
+    caption="✅ اكتمل تفريغ الملف بنجاح.",
+    reply_markup=None
 ):
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
@@ -1268,13 +1590,20 @@ def send_transcript_to_telegram(
         f"bot{TELEGRAM_BOT_TOKEN}/sendDocument"
     )
 
+    data = {
+        "chat_id": telegram_user_id,
+        "caption": caption[:1024]
+    }
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(
+            reply_markup,
+            ensure_ascii=False
+        )
+
     with open(output_file, "rb") as document:
         response = requests.post(
             url,
-            data={
-                "chat_id": telegram_user_id,
-                "caption": caption
-            },
+            data=data,
             files={
                 "document": (
                     download_name,
@@ -1297,6 +1626,221 @@ def send_transcript_to_telegram(
             f"{response.status_code}"
         )
 
+
+def send_document_bytes(
+    chat_id,
+    payload,
+    download_name,
+    caption="",
+    mime="application/octet-stream",
+    reply_markup=None
+):
+    """إرسال ملف من الذاكرة (تصدير DOCX/TXT عند الطلب)."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+
+    data = {
+        "chat_id": chat_id,
+        "caption": (caption or "")[:1024]
+    }
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(
+            reply_markup,
+            ensure_ascii=False
+        )
+
+    response = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+        data=data,
+        files={"document": (download_name, payload, mime)},
+        timeout=120
+    )
+
+    print(
+        f"[TELEGRAM DOC] HTTP {response.status_code}: "
+        f"{response.text[:300]}",
+        flush=True
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Telegram sendDocument HTTP {response.status_code}"
+        )
+
+
+def answer_callback(callback_id, text=None, alert=False):
+    """إيقاف مؤشر الانتظار على الزر؛ الفشل هنا لا يهم."""
+    if not callback_id or not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
+            "answerCallbackQuery",
+            data={
+                "callback_query_id": callback_id,
+                "text": (text or "")[:200],
+                "show_alert": "true" if alert else "false"
+            },
+            timeout=15
+        )
+    except Exception as e:
+        print(f"[CALLBACK ANSWER ERROR] {e}", flush=True)
+
+
+def _user_hash(user_id):
+    """بصمة ثابتة للمستخدم تُنشر في قناة الأرشيف بدل معرّفه."""
+    try:
+        return hmac.new(
+            (TELEGRAM_BOT_TOKEN or "waqqad").encode("utf-8"),
+            str(user_id or "").encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()[:12]
+    except Exception:
+        return "unknown"
+
+
+def _archive_transcript(job_id, text, job):
+    """نسخة احتياطية من النص في قناة السجل الخاصة.
+
+    نرسل الملف لا الرسالة، لأن رسالة تليجرام محدودة بـ4096 حرفًا
+    والمحاضرة قد تتجاوز ذلك بعشرات المرات.
+    """
+    if not TRANSCRIBER_LOG_CHAT_ID or not text.strip():
+        return
+
+    try:
+        output_name = job.get("output_name") or "transcript.txt"
+        name = f"{Path(output_name).stem}.txt"
+        send_document_bytes(
+            TRANSCRIBER_LOG_CHAT_ID,
+            build_txt(text),
+            name,
+            caption=(
+                "🗄️ أرشيف تفريغ\n"
+                f"👤 بصمة: {_user_hash(job.get('telegram_user_id'))}\n"
+                f"📄 الملف: {job.get('original_filename') or 'غير معروف'}\n"
+                f"🔤 الأحرف: {len(text)}\n"
+                f"🆔 المهمة: {job_id}"
+            ),
+            mime=TXT_MIME
+        )
+    except Exception as e:
+        # الأرشفة لا تُفشل التفريغ.
+        print(f"[ARCHIVE ERROR] Job {job_id}: {e}", flush=True)
+
+
+def _result_keyboard(job_id, kinds):
+    """أزرار التصدير لرسالة النتيجة."""
+    rows = []
+
+    if "raw" in kinds:
+        rows.append([
+            {
+                "text": "📝 DOCX",
+                "callback_data": f"f:{job_id}:raw:docx"
+            },
+            {
+                "text": "📄 TXT",
+                "callback_data": f"f:{job_id}:raw:txt"
+            }
+        ])
+
+    return {"inline_keyboard": rows} if rows else None
+
+
+def _refined_keyboard(job_id, kinds):
+    """أزرار النسختين المصححة والمحسّنة."""
+    rows = []
+
+    for kind, label in (
+        ("conservative", "📝 المصححة"),
+        ("liberal", "✨ المحسّنة")
+    ):
+        if kind not in kinds:
+            continue
+        rows.append([
+            {
+                "text": f"{label} DOCX",
+                "callback_data": f"f:{job_id}:{kind}:docx"
+            },
+            {
+                "text": f"{label} TXT",
+                "callback_data": f"f:{job_id}:{kind}:txt"
+            }
+        ])
+
+    return {"inline_keyboard": rows} if rows else None
+
+
+def handle_transcriber_callback(update):
+    """أزرار التصدير بصيغة f:<job_id>:<kind>:<fmt>."""
+    callback = update.get("callback_query") or {}
+    if not callback:
+        return
+
+    callback_id = callback.get("id")
+    data = callback.get("data") or ""
+    sender = callback.get("from") or {}
+    user_id = sender.get("id")
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id") or user_id
+
+    if not data.startswith("f:"):
+        answer_callback(callback_id, "خيار غير معروف")
+        return
+
+    try:
+        _, job_id, kind, fmt = data.split(":", 3)
+    except ValueError:
+        answer_callback(callback_id, "خيار غير صالح")
+        return
+
+    job = get_job(job_id)
+    if not job or str(job.get("telegram_user_id")) != str(user_id):
+        answer_callback(callback_id, "هذا التفريغ ليس لك", alert=True)
+        return
+
+    row = transcript_store.get_transcript(job_id, kind)
+    if not row:
+        answer_callback(
+            callback_id,
+            "انتهت صلاحية النص. أعد إرسال الملف ليُفرَّغ من جديد.",
+            alert=True
+        )
+        return
+
+    text = row.get("content") or ""
+    stem = Path(job.get("original_filename") or "transcript").stem
+    suffix = {
+        "conservative": "_med",
+        "liberal": "_well",
+        "summary": "_summary",
+    }.get(kind, "")
+    extension = "docx" if fmt == "docx" else "txt"
+    name = f"{stem}{suffix}.{extension}"
+
+    try:
+        if extension == "docx":
+            payload = build_docx(text, title=stem)
+            mime = DOCX_MIME
+        else:
+            payload = build_txt(text)
+            mime = TXT_MIME
+
+        send_document_bytes(
+            chat_id,
+            payload,
+            name,
+            caption=f"📄 {name}",
+            mime=mime
+        )
+        answer_callback(callback_id, "تم الإرسال")
+    except Exception as e:
+        print(
+            f"[EXPORT ERROR] {job_id}/{kind}/{fmt}: {e}",
+            flush=True
+        )
+        answer_callback(callback_id, "تعذّر إرسال الملف", alert=True)
 
 
 def _refine_failure_hint(exc):
@@ -1376,6 +1920,8 @@ def send_refined_versions_async(job_id, raw_output_file):
         ),
     ]
 
+    refined_files = []
+
     for mode, suffix, caption in versions:
         try:
             print(
@@ -1391,15 +1937,17 @@ def send_refined_versions_async(job_id, raw_output_file):
 
             refined_path = raw_path.with_name(f"{base_stem}{suffix}")
             refined_path.write_text(text, encoding="utf-8")
+            refined_files.append((refined_path, caption))
 
-            send_transcript_to_telegram(
+            transcript_store.save_transcript(
+                job_id,
                 telegram_user_id,
-                refined_path,
-                download_name=refined_path.name,
-                caption=caption
+                mode,
+                text,
+                title=base_stem or None
             )
             print(
-                f"[AUTO-REFINE] {mode} sent for job {job_id}",
+                f"[AUTO-REFINE] {mode} stored for job {job_id}",
                 flush=True
             )
 
@@ -1441,6 +1989,37 @@ def send_refined_versions_async(job_id, raw_output_file):
                     flush=True
                 )
                 break
+
+    kinds = transcript_store.available_kinds(job_id)
+    keyboard = _refined_keyboard(job_id, kinds)
+
+    if keyboard:
+        try:
+            telegram_send_message(
+                telegram_user_id,
+                "✨ اكتمل التدقيق.\n"
+                "النسختان محفوظتان، ويمكنك تنزيلهما في أي وقت "
+                "من هذه الأزرار أو بأمر /find.\n"
+                "اختر الصيغة:",
+                keyboard
+            )
+        except Exception as e:
+            print(f"[AUTO-REFINE] Panel message failed: {e}", flush=True)
+    else:
+        # إن تعذّر الحفظ في القاعدة، أرسل الملفات كما كان البوت يفعل.
+        for refined_path, caption in refined_files:
+            try:
+                send_transcript_to_telegram(
+                    telegram_user_id,
+                    refined_path,
+                    download_name=refined_path.name,
+                    caption=caption
+                )
+            except Exception as e:
+                print(
+                    f"[AUTO-REFINE] Fallback send failed: {e}",
+                    flush=True
+                )
 
 
 # ============================================================
@@ -1551,42 +2130,21 @@ def transcribe():
 
     create_job(
         job_id,
-        {
-            "job_id": job_id,
-            "status": "queued",
-            "stage": "queued",
-            "error": None,
-            "output_file": None,
-            "original_filename": uploaded_file.filename,
-            "file_size_bytes": file_size,
-            "started_at": time.time(),
-            "completed_at": None,
-            "processing_seconds": None,
-            "deepgram_request_id": None,
-            "engine": None,
-            "fallback_used": False,
-            "fallback_reason": None,
-            "cohere_key_index": None,
-            "cohere_keys_used": [],
-            "current_part": None,
-            "total_parts": None,
-            "telegram_user_id":
-                telegram_user_id,
-            "telegram_sent": False,
-            "telegram_error": None
-        }
-    )
-
-    thread = threading.Thread(
-        target=process_transcription_job,
-        args=(
+        new_job_payload(
             job_id,
-            input_file
-        ),
-        daemon=True
+            uploaded_file.filename,
+            file_size,
+            telegram_user_id,
+            source="web"
+        )
     )
 
-    thread.start()
+    job_queue.enqueue(
+        job_id,
+        process_transcription_job,
+        job_id,
+        input_file
+    )
 
     return jsonify({
         "job_id": job_id,
@@ -1803,7 +2361,10 @@ def transcriber_webhook():
     )
 
     try:
-        handle_transcriber_chat_update(update)
+        if update.get("callback_query"):
+            handle_transcriber_callback(update)
+        else:
+            handle_transcriber_chat_update(update)
     except Exception as e:
         print(
             f"[TRANSCRIBER BOT ERROR] {type(e).__name__}: {e}",
