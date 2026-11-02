@@ -80,12 +80,15 @@ python app.py
 ```bash
 curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
   -d "url=https://<BASE_URL>/telegram/transcriber" \
-  -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+  -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>" \
+  -d 'allowed_updates=["message","callback_query"]'
 
 curl -X POST "https://api.telegram.org/bot<WARRAQ_BOT_TOKEN>/setWebhook" \
   -d "url=https://<BASE_URL>/telegram/warraq" \
   -d "secret_token=<WARRAQ_WEBHOOK_SECRET>"
 ```
+
+`allowed_updates` يجب أن يحتوي `callback_query`، وإلا فلن تصل ضغطات أزرار التصدير إلى الخادم أصلًا. عند الإقلاع يفحص التطبيق `getWebhookInfo` ويضيف `callback_query` تلقائيًا إن كانت القائمة مقيّدة بدونه، ويطبع النتيجة في السجل تحت `[WEBHOOK CHECK]`.
 
 ## التفريغ المباشر من المحادثة
 
@@ -95,7 +98,8 @@ curl -X POST "https://api.telegram.org/bot<WARRAQ_BOT_TOKEN>/setWebhook" \
 - ما يتجاوز الحد يردّ عليه البوت برسالة واضحة وزر يفتح صفحة الرفع، لأن حد تليجرام نفسه هو 20MB.
 - المهام تدخل طابوراً بعدد عمال ثابت، فيرى المستخدم ترتيبه بدل أن يفشل طلبه بصمت عند الزحام.
 - بعد النتيجة تظهر أزرار لتنزيل TXT أو DOCX، ولنسختي التدقيق لاحقاً.
-- `/find كلمة` يبحث في تفريغات المستخدم السابقة، و`/find` وحده يعرض آخر تفريغاته.
+- `/find كلمة` يبحث داخل **نص التفريغ كاملًا** لا في أسماء الملفات، بعد تطبيع عربي يتجاهل التشكيل والتطويل ويوحّد الهمزات (أ/إ/آ → ا) والتاء المربوطة (ة → ه)، ويزيل السوابق الشائعة (ال، وال، بال…). فكلمة «محاضرة» تجد «المحاضرة»، و«اصول» تجد «الأصول».
+- `/find` وحده يعرض آخر تفريغات المستخدم، مع أزرار DOCX وTXT لكل نتيجة.
 
 كل تفريغ يُحفظ في جدول `transcripts` ويُرسل ملفه النصي إلى قناة السجل إن كانت مضبوطة، مع بصمة مختصرة للمستخدم بدل معرّفه.
 

@@ -253,6 +253,75 @@ def _webhook_secret_ok(configured):
     )
     return hmac.compare_digest(received, configured)
 
+
+def ensure_webhook_updates():
+    """تضمن أن تليجرام يرسل ضغطات الأزرار (callback_query).
+
+    سبب وجود هذه الدالة عملي: إن سُجّل الويبهوك سابقًا بقائمة
+    allowed_updates لا تحتوي callback_query، فإن أزرار TXT/DOCX لا تصل
+    إلى الخادم أصلًا، فيبدو الزر «ميتًا» بلا أي خطأ في السجلات.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    target_url = f"{BASE_URL.rstrip('/')}/telegram/transcriber"
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+    try:
+        info = requests.get(f"{api}/getWebhookInfo", timeout=20).json()
+    except Exception as e:
+        print(f"[WEBHOOK CHECK] Could not read webhook info: {e}", flush=True)
+        return
+
+    if not info.get("ok"):
+        print(
+            f"[WEBHOOK CHECK] getWebhookInfo failed: {info.get('description')}",
+            flush=True
+        )
+        return
+
+    result = info.get("result") or {}
+    allowed = result.get("allowed_updates") or []
+    current_url = (result.get("url") or "").strip() or target_url
+
+    # قائمة فارغة تعني «كل التحديثات»؛ لا نتدخل حينها.
+    if not allowed or "callback_query" in allowed:
+        print(
+            "[WEBHOOK CHECK] callback_query delivery is enabled.",
+            flush=True
+        )
+        return
+
+    wanted = sorted(set(allowed) | {"message", "callback_query"})
+    payload = {
+        "url": current_url,
+        "allowed_updates": json.dumps(wanted),
+        "drop_pending_updates": "false",
+    }
+    if TELEGRAM_WEBHOOK_SECRET:
+        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+
+    try:
+        response = requests.post(
+            f"{api}/setWebhook", data=payload, timeout=30
+        ).json()
+    except Exception as e:
+        print(f"[WEBHOOK CHECK] Could not update webhook: {e}", flush=True)
+        return
+
+    if response.get("ok"):
+        print(
+            f"[WEBHOOK CHECK] Enabled callback_query. allowed_updates={wanted}",
+            flush=True
+        )
+    else:
+        print(
+            "[WEBHOOK CHECK] setWebhook refused: "
+            f"{response.get('description')}",
+            flush=True
+        )
+
+
 # ============================================================
 # تخزين المهام - PostgreSQL (Neon)
 # ============================================================
@@ -357,6 +426,21 @@ if not TELEGRAM_WEBHOOK_SECRET or not WARRAQ_WEBHOOK_SECRET:
         flush=True
     )
 
+# أزرار التصدير لا تعمل إن لم تكن callback_query ضمن allowed_updates.
+# نجري الفحص في خيط خلفي حتى لا يتأخر إقلاع التطبيق أو الاختبارات.
+def _webhook_check_startup():
+    try:
+        ensure_webhook_updates()
+    except Exception as e:
+        print(f"[WEBHOOK CHECK] Warning: {e}", flush=True)
+
+
+threading.Thread(
+    target=_webhook_check_startup,
+    name="webhook-check",
+    daemon=True
+).start()
+
 def create_job(job_id, data):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -415,6 +499,15 @@ def get_job(job_id):
             if isinstance(data, str):
                 return json.loads(data)
             return data
+
+
+def job_label(job, fallback="ملف"):
+    """اسم قصير يميّز المهمة في الرسائل المتزامنة."""
+    name = (job or {}).get("original_filename") or fallback
+    name = Path(str(name)).name
+    if len(name) > 40:
+        name = name[:37] + "…"
+    return name
 
 
 def new_job_payload(
@@ -833,7 +926,7 @@ def finalize_transcript(job_id, transcript, engine):
         duration_text = f"{minutes} د {seconds} ث"
 
     caption = (
-        "✅ اكتمل تفريغ الملف بنجاح.\n"
+        f"✅ اكتمل تفريغ: {job_label(job, original_filename)}\n"
         f"⏱️ وقت المعالجة: {duration_text}\n"
         f"⚙️ المحرك: {engine_label}\n"
         f"🧩 الأجزاء: {total_parts}"
@@ -1437,11 +1530,14 @@ def handle_bot_attachment(chat, sender, attachment):
         destination
     )
 
-    queue_note = (
-        f"⏳ ترتيبك في الطابور: {position}"
-        if position > 1
-        else "⚡ سأبدأ به الآن."
-    )
+    queue_stats = job_queue.stats()
+    ahead = max(0, queue_stats.get("waiting", position) - 1)
+    ahead += queue_stats.get("running", 0)
+
+    if ahead <= 0:
+        queue_note = "⚡ سأبدأ به الآن."
+    else:
+        queue_note = f"⏳ أمامك {ahead} مهمة في الطابور."
 
     telegram_send_message(
         chat_id,
@@ -1456,6 +1552,7 @@ def run_bot_job(job_id, attachment, destination):
     """يعمل داخل عامل الطابور: تنزيل الملف ثم تفريغه."""
     job = get_job(job_id) or {}
     telegram_user_id = job.get("telegram_user_id")
+    label = job_label(job, attachment.get("file_name") or "ملف")
 
     try:
         update_job(job_id, stage="downloading")
@@ -1471,7 +1568,7 @@ def run_bot_job(job_id, attachment, destination):
         if telegram_user_id:
             telegram_send_message(
                 telegram_user_id,
-                f"⬇️ تم التنزيل ({format_size(size)}).\n"
+                f"⬇️ {label}: تم التنزيل ({format_size(size)}).\n"
                 "🎧 بدأ التفريغ الآن، وسأرسل النص عند اكتماله."
             )
 
@@ -1488,7 +1585,7 @@ def run_bot_job(job_id, attachment, destination):
         if telegram_user_id:
             telegram_send_message(
                 telegram_user_id,
-                "⚠️ تجاوز الملف الحد المسموح للتنزيل.\n"
+                f"⚠️ {label}: تجاوز الملف الحد المسموح للتنزيل.\n"
                 "ارفعه من صفحة الرفع، وستصل النتيجة هنا."
             )
 
@@ -1547,7 +1644,9 @@ def handle_find(chat_id, user_id, query):
         return
 
     header = (
-        f"🔍 نتائج «{query}»:" if query else "🗂️ آخر تفريغاتك:"
+        f"🔍 نتائج «{query}» ({len(rows)}):"
+        if query
+        else f"🗂️ آخر تفريغاتك ({len(rows)}):"
     )
     lines = [header]
     keyboard = []
@@ -1556,13 +1655,19 @@ def handle_find(chat_id, user_id, query):
         title = row.get("title") or "تفريغ"
         created = row.get("created_at")
         when = created.strftime("%Y-%m-%d") if created else ""
-        lines.append(
-            f"{index}. {title} — {when} — {row.get('chars') or 0} حرف"
-        )
-        keyboard.append([{
-            "text": f"📄 {index}. {title[:40]}",
-            "callback_data": f"f:{row['job_id']}:raw:txt"
-        }])
+        chars = row.get("chars") or 0
+        lines.append(f"{index}. {title} — {when} — {chars} حرف")
+        short = title[:28]
+        keyboard.append([
+            {
+                "text": f"📝 {index}. {short} DOCX",
+                "callback_data": f"f:{row['job_id']}:raw:docx"
+            },
+            {
+                "text": f"📄 {index}. {short} TXT",
+                "callback_data": f"f:{row['job_id']}:raw:txt"
+            }
+        ])
 
     telegram_send_message(
         chat_id,
@@ -1785,6 +1890,11 @@ def handle_transcriber_callback(update):
     message = callback.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id") or user_id
 
+    print(
+        f"[CALLBACK] id={callback_id} user={user_id} data={data!r}",
+        flush=True
+    )
+
     if not data.startswith("f:"):
         answer_callback(callback_id, "خيار غير معروف")
         return
@@ -1792,19 +1902,36 @@ def handle_transcriber_callback(update):
     try:
         _, job_id, kind, fmt = data.split(":", 3)
     except ValueError:
-        answer_callback(callback_id, "خيار غير صالح")
+        answer_callback(callback_id, "خيار غير صالح", alert=True)
         return
 
-    job = get_job(job_id)
-    if not job or str(job.get("telegram_user_id")) != str(user_id):
-        answer_callback(callback_id, "هذا التفريغ ليس لك", alert=True)
+    kind = (kind or "").strip()
+    fmt = (fmt or "").strip().lower()
+
+    if fmt not in {"txt", "docx"} or kind not in transcript_store.KINDS:
+        answer_callback(callback_id, "صيغة تصدير غير معروفة", alert=True)
         return
 
     row = transcript_store.get_transcript(job_id, kind)
+    job = get_job(job_id) or {}
+
+    owner = row.get("user_id") if row else job.get("telegram_user_id")
+    if owner is None or str(owner) != str(user_id):
+        print(
+            f"[CALLBACK] ownership rejected: owner={owner} user={user_id}",
+            flush=True
+        )
+        answer_callback(callback_id, "هذا التفريغ ليس لك", alert=True)
+        return
+
     if not row:
+        print(
+            f"[CALLBACK] transcript missing job={job_id} kind={kind}",
+            flush=True
+        )
         answer_callback(
             callback_id,
-            "انتهت صلاحية النص. أعد إرسال الملف ليُفرَّغ من جديد.",
+            "هذه النسخة غير محفوظة. جرّب النسخة الخام من /find.",
             alert=True
         )
         return
@@ -1816,8 +1943,11 @@ def handle_transcriber_callback(update):
         "liberal": "_well",
         "summary": "_summary",
     }.get(kind, "")
-    extension = "docx" if fmt == "docx" else "txt"
+    extension = fmt
     name = f"{stem}{suffix}.{extension}"
+
+    # أُغلق المؤشر الآن، ثم يأتي الملف في رسالة مستقلة.
+    answer_callback(callback_id, "جارٍ تجهيز الملف…")
 
     try:
         if extension == "docx":
@@ -1827,6 +1957,11 @@ def handle_transcriber_callback(update):
             payload = build_txt(text)
             mime = TXT_MIME
 
+        print(
+            f"[CALLBACK] sending {name} ({len(payload)} bytes) "
+            f"to chat {chat_id}",
+            flush=True
+        )
         send_document_bytes(
             chat_id,
             payload,
@@ -1834,13 +1969,21 @@ def handle_transcriber_callback(update):
             caption=f"📄 {name}",
             mime=mime
         )
-        answer_callback(callback_id, "تم الإرسال")
     except Exception as e:
         print(
-            f"[EXPORT ERROR] {job_id}/{kind}/{fmt}: {e}",
+            f"[EXPORT ERROR] job={job_id} kind={kind} fmt={fmt}: "
+            f"{type(e).__name__}: {e}",
             flush=True
         )
-        answer_callback(callback_id, "تعذّر إرسال الملف", alert=True)
+        try:
+            telegram_send_message(
+                chat_id,
+                "❌ تعذّر تجهيز الملف للتنزيل.\n"
+                f"السبب: {type(e).__name__}\n"
+                "أعد المحاولة بعد قليل، وإن تكرر أبلغنا."
+            )
+        except Exception:
+            pass
 
 
 def _refine_failure_hint(exc):
@@ -1897,6 +2040,7 @@ def send_refined_versions_async(job_id, raw_output_file):
     try:
         telegram_send_message(
             telegram_user_id,
+            f"🎧 {job_label(job, original_name)}\n"
             "✅ تم استخراج النص الخام.\n"
             "⏳ جارٍ الآن تجهيز نسختين إضافيتين: "
             "مصححة إملائياً، ومحسّنة للقراءة.\n"
@@ -1997,7 +2141,7 @@ def send_refined_versions_async(job_id, raw_output_file):
         try:
             telegram_send_message(
                 telegram_user_id,
-                "✨ اكتمل التدقيق.\n"
+                f"✨ اكتمل التدقيق: {job_label(job, original_name)}\n"
                 "النسختان محفوظتان، ويمكنك تنزيلهما في أي وقت "
                 "من هذه الأزرار أو بأمر /find.\n"
                 "اختر الصيغة:",
