@@ -144,6 +144,23 @@ TRANSCRIBER_LOG_CHAT_ID = os.environ.get(
     ""
 ).strip()
 
+# هوية المطوّر والمساهمين، تظهر في /about و/start.
+DEVELOPER_NAME = os.environ.get(
+    "DEVELOPER_NAME", "الوقّاد"
+).strip() or "الوقّاد"
+DEVELOPER_CONTACT = os.environ.get(
+    "DEVELOPER_CONTACT",
+    "https://github.com/ALWAQAD-afk"
+).strip()
+
+
+def contributors_text():
+    """سطر المساهمين، قابل للتعديل دون لمس الكود."""
+    custom = os.environ.get("CONTRIBUTORS", "").strip()
+    if custom:
+        return custom
+    return "عدة نماذج لغوية ساعدت في التصميم والكتابة والاختبار"
+
 
 JOBS_FILE = Path("/tmp/waqqad_jobs.json")
 jobs_lock = threading.Lock()
@@ -982,6 +999,12 @@ def finalize_transcript(job_id, transcript, engine):
             )
             telegram_sent = True
             telegram_error = None
+
+            # بعد وصول النتيجة تتبخّر رسالة الحالة.
+            try:
+                delete_status_message(job_id)
+            except Exception:
+                pass
         else:
             telegram_sent = False
             telegram_error = "No Telegram user ID stored for this job"
@@ -989,6 +1012,15 @@ def finalize_transcript(job_id, transcript, engine):
         telegram_sent = False
         telegram_error = str(e)
         print(f"[TELEGRAM ERROR] Job {job_id}: {e}", flush=True)
+        try:
+            update_status_message(
+                job_id,
+                f"❌ {job_label(job, original_filename)}: "
+                "تعذّر إرسال النتيجة.\n"
+                "التفريغ محفوظ، ويمكنك تنزيله بأمر /find."
+            )
+        except Exception:
+            pass
 
     update_job(
         job_id,
@@ -1295,11 +1327,136 @@ def telegram_send_message(chat_id, text, reply_markup=None):
         flush=True
     )
 
-    if response.status_code != 200:
+    data = response.json() if response.content else {}
+
+    if response.status_code != 200 or not data.get("ok"):
         raise RuntimeError(
             f"Telegram sendMessage HTTP {response.status_code}: "
             f"{response.text[:300]}"
         )
+
+    return (data.get("result") or {}).get("message_id")
+
+
+def telegram_edit_message(chat_id, message_id, text):
+    """تعديل رسالة قائمة. «not modified» ليست خطأ."""
+    if not chat_id or not message_id:
+        return False
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
+            "editMessageText",
+            data={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text[:4096],
+                "disable_web_page_preview": "true",
+            },
+            timeout=20
+        )
+        data = response.json() if response.content else {}
+        description = str(data.get("description") or "")
+        if data.get("ok") or "message is not modified" in description:
+            return True
+
+        print(
+            f"[STATUS] edit failed HTTP {response.status_code}: "
+            f"{description[:200]}",
+            flush=True
+        )
+    except Exception as e:
+        print(f"[STATUS] edit error: {e}", flush=True)
+
+    return False
+
+
+def telegram_delete_message(chat_id, message_id):
+    """حذف رسالة أرسلها البوت. الفشل غير قاتل."""
+    if not chat_id or not message_id:
+        return False
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
+            "deleteMessage",
+            data={"chat_id": chat_id, "message_id": message_id},
+            timeout=20
+        )
+        data = response.json() if response.content else {}
+        if data.get("ok"):
+            return True
+        print(
+            f"[STATUS] delete failed HTTP {response.status_code}: "
+            f"{str(data.get('description'))[:200]}",
+            flush=True
+        )
+    except Exception as e:
+        print(f"[STATUS] delete error: {e}", flush=True)
+
+    return False
+
+
+def _status_keys(prefix):
+    return f"{prefix}_chat_id", f"{prefix}_message_id"
+
+
+def send_status_message(job_id, chat_id, text, prefix="status"):
+    """يرسل رسالة حالة ويحفظ معرّفها في المهمة لتُعدَّل أو تُحذف لاحقًا."""
+    if not chat_id:
+        return None
+
+    try:
+        message_id = telegram_send_message(chat_id, text)
+    except Exception as e:
+        print(f"[STATUS] send failed: {e}", flush=True)
+        return None
+
+    if message_id:
+        chat_key, message_key = _status_keys(prefix)
+        update_job(
+            job_id,
+            **{chat_key: chat_id, message_key: message_id}
+        )
+
+    return message_id
+
+
+def update_status_message(job_id, text, prefix="status"):
+    """يعدّل رسالة الحالة نفسها، فلا تتراكم رسائل لكل مرحلة."""
+    job = get_job(job_id) or {}
+    chat_key, message_key = _status_keys(prefix)
+    chat_id = job.get(chat_key)
+    message_id = job.get(message_key)
+
+    if chat_id and message_id:
+        if telegram_edit_message(chat_id, message_id, text):
+            return True
+        # إن تعذّر التعديل (رسالة قديمة أو محذوفة) نرسل بديلًا واحدًا.
+        print(
+            f"[STATUS] falling back to a new message for job {job_id}",
+            flush=True
+        )
+
+    return send_status_message(
+        job_id,
+        chat_id or job.get("telegram_user_id"),
+        text,
+        prefix
+    ) is not None
+
+
+def delete_status_message(job_id, prefix="status"):
+    """تُبخّر رسالة الحالة بعد وصول النتيجة."""
+    job = get_job(job_id) or {}
+    chat_key, message_key = _status_keys(prefix)
+    chat_id = job.get(chat_key)
+    message_id = job.get(message_key)
+
+    deleted = telegram_delete_message(chat_id, message_id)
+
+    update_job(job_id, **{chat_key: None, message_key: None})
+    return deleted
 
 
 def _format_duration(seconds):
@@ -1441,7 +1598,8 @@ def handle_transcriber_chat_update(update):
             "وسأعيد لك التفريغ هنا.\n\n"
             "• حتى 20MB يُفرّغ مباشرة.\n"
             "• الأكبر من ذلك من صفحة الرفع.\n"
-            "• /find للبحث في تفريغاتك السابقة."
+            "• /find للبحث في تفريغاتك السابقة.\n\n"
+            f"👨‍💻 تطوير: {DEVELOPER_NAME} — /about للتفاصيل."
         )
     elif command == "/help":
         reply = (
@@ -1451,8 +1609,19 @@ def handle_transcriber_chat_update(update):
             "3) نزّل DOCX أو TXT من الأزرار أسفل النتيجة.\n\n"
             "🔍 /find كلمة — البحث في تفريغاتك.\n"
             "🔍 /find — آخر تفريغاتك.\n"
-            "🗂️ كل تفريغ يُحفظ في أرشيفك الخاص.\n\n"
+            "🗂️ كل تفريغ يُحفظ في أرشيفك الخاص.\n"
+            "👨‍💻 /about — المطوّر والمساهمون ووسيلة التواصل.\n\n"
             "الملفات الأكبر من 20MB تُرفع من صفحة الرفع أدناه."
+        )
+    elif command == "/about":
+        reply = (
+            "🎙️ مفرّغ الوقّاد\n\n"
+            f"👨‍💻 المطوّر: {DEVELOPER_NAME}\n"
+            f"🤝 المساهمون: {contributors_text()}\n"
+            f"📬 للتواصل والملاحظات: {DEVELOPER_CONTACT}\n\n"
+            "🔐 تفريغاتك محفوظة في أرشيفك الخاص، "
+            "ولا يراها مستخدم آخر.\n"
+            "🗑️ لطلب حذف تفريغ، راسل المطوّر."
         )
     elif command == "/find":
         handle_find(chat_id, user_id, argument)
@@ -1522,24 +1691,17 @@ def handle_bot_attachment(chat, sender, attachment):
         )
     )
 
-    position = job_queue.enqueue(
-        job_id,
-        run_bot_job,
-        job_id,
-        attachment,
-        destination
-    )
-
-    queue_stats = job_queue.stats()
-    ahead = max(0, queue_stats.get("waiting", position) - 1)
-    ahead += queue_stats.get("running", 0)
+    stats_before = job_queue.stats()
+    ahead = stats_before.get("waiting", 0) + stats_before.get("running", 0)
 
     if ahead <= 0:
         queue_note = "⚡ سأبدأ به الآن."
     else:
         queue_note = f"⏳ أمامك {ahead} مهمة في الطابور."
 
-    telegram_send_message(
+    # رسالة استلام واحدة تتطور لاحقًا إلى «جارٍ التفريغ» ثم تتبخّر.
+    send_status_message(
+        job_id,
         chat_id,
         f"📥 وصلني: {attachment.get('file_name')}\n"
         f"📦 الحجم: {format_size(size)}\n"
@@ -1547,11 +1709,33 @@ def handle_bot_attachment(chat, sender, attachment):
         "يمكنك إغلاق المحادثة، وستصل النتيجة هنا."
     )
 
+    try:
+        job_queue.enqueue(
+            job_id,
+            run_bot_job,
+            job_id,
+            attachment,
+            destination
+        )
+    except Exception as e:
+        print(f"[QUEUE ERROR] job {job_id}: {e}", flush=True)
+        update_job(
+            job_id,
+            status="failed",
+            stage="error",
+            error=f"enqueue failed: {e}"
+        )
+        update_status_message(
+            job_id,
+            f"❌ {attachment.get('file_name')}: تعذّر إدخال الملف "
+            "في الطابور. أعد المحاولة."
+        )
+        log_transcription_failure(job_id)
+
 
 def run_bot_job(job_id, attachment, destination):
     """يعمل داخل عامل الطابور: تنزيل الملف ثم تفريغه."""
     job = get_job(job_id) or {}
-    telegram_user_id = job.get("telegram_user_id")
     label = job_label(job, attachment.get("file_name") or "ملف")
 
     try:
@@ -1565,12 +1749,12 @@ def run_bot_job(job_id, attachment, destination):
 
         update_job(job_id, stage="processing", file_size_bytes=size)
 
-        if telegram_user_id:
-            telegram_send_message(
-                telegram_user_id,
-                f"⬇️ {label}: تم التنزيل ({format_size(size)}).\n"
-                "🎧 بدأ التفريغ الآن، وسأرسل النص عند اكتماله."
-            )
+        update_status_message(
+            job_id,
+            f"🎧 {label}\n"
+            "✅ تم التنزيل.\n"
+            "⏳ جارٍ التفريغ الآن، وسيصلك النص عند اكتماله."
+        )
 
         process_transcription_job(job_id, destination)
 
@@ -1582,12 +1766,12 @@ def run_bot_job(job_id, attachment, destination):
             error=f"file too large: {e}"
         )
         log_transcription_failure(job_id)
-        if telegram_user_id:
-            telegram_send_message(
-                telegram_user_id,
-                f"⚠️ {label}: تجاوز الملف الحد المسموح للتنزيل.\n"
-                "ارفعه من صفحة الرفع، وستصل النتيجة هنا."
-            )
+        update_status_message(
+            job_id,
+            f"⚠️ {label}: تجاوز الملف الحد المسموح للتنزيل.\n"
+            f"ارفعه من صفحة الرفع وستصل النتيجة هنا:\n"
+            f"{TRANSCRIBER_WEBAPP_URL}"
+        )
 
     except (DownloadFailed, UnsupportedFile) as e:
         update_job(
@@ -1597,12 +1781,11 @@ def run_bot_job(job_id, attachment, destination):
             error=f"download failed: {e}"
         )
         log_transcription_failure(job_id)
-        if telegram_user_id:
-            telegram_send_message(
-                telegram_user_id,
-                "❌ تعذّر تنزيل الملف من تليجرام. أعد إرساله، "
-                "أو ارفعه من صفحة الرفع."
-            )
+        update_status_message(
+            job_id,
+            f"❌ {label}: تعذّر تنزيل الملف من تليجرام.\n"
+            "أعد إرساله، أو ارفعه من صفحة الرفع."
+        )
 
     except Exception as e:
         print(
@@ -1616,12 +1799,11 @@ def run_bot_job(job_id, attachment, destination):
             error=str(e)
         )
         log_transcription_failure(job_id)
-        if telegram_user_id:
-            telegram_send_message(
-                telegram_user_id,
-                "❌ حدث خطأ غير متوقع أثناء تجهيز الملف.\n"
-                "أعد المحاولة، وإن تكرر فأبلغنا."
-            )
+        update_status_message(
+            job_id,
+            f"❌ {label}: حدث خطأ غير متوقع أثناء التجهيز.\n"
+            "أعد المحاولة، وإن تكرر فأبلغنا عبر /about."
+        )
 
 
 def handle_find(chat_id, user_id, query):
@@ -2037,17 +2219,16 @@ def send_refined_versions_async(job_id, raw_output_file):
         )
         return
 
-    try:
-        telegram_send_message(
-            telegram_user_id,
-            f"🎧 {job_label(job, original_name)}\n"
-            "✅ تم استخراج النص الخام.\n"
-            "⏳ جارٍ الآن تجهيز نسختين إضافيتين: "
-            "مصححة إملائياً، ومحسّنة للقراءة.\n"
-            "قد يستغرق الأمر بضع دقائق حسب طول الملف."
-        )
-    except Exception as e:
-        print(f"[AUTO-REFINE] Status message failed: {e}", flush=True)
+    send_status_message(
+        job_id,
+        telegram_user_id,
+        f"🎧 {job_label(job, original_name)}\n"
+        "✅ تم استخراج النص الخام.\n"
+        "⏳ جارٍ الآن تجهيز نسختين إضافيتين: "
+        "مصححة إملائياً، ومحسّنة للقراءة.\n"
+        "قد يستغرق الأمر بضع دقائق حسب طول الملف.",
+        prefix="refine"
+    )
 
     versions = [
         (
@@ -2147,8 +2328,15 @@ def send_refined_versions_async(job_id, raw_output_file):
                 "اختر الصيغة:",
                 keyboard
             )
+            delete_status_message(job_id, prefix="refine")
         except Exception as e:
             print(f"[AUTO-REFINE] Panel message failed: {e}", flush=True)
+            update_status_message(
+                job_id,
+                f"⚠️ {job_label(job, original_name)}: اكتمل التدقيق، "
+                "لكن تعذّر إرسال أزرار التنزيل. استخدم /find.",
+                prefix="refine"
+            )
     else:
         # إن تعذّر الحفظ في القاعدة، أرسل الملفات كما كان البوت يفعل.
         for refined_path, caption in refined_files:
@@ -2164,6 +2352,7 @@ def send_refined_versions_async(job_id, raw_output_file):
                     f"[AUTO-REFINE] Fallback send failed: {e}",
                     flush=True
                 )
+        delete_status_message(job_id, prefix="refine")
 
 
 # ============================================================
