@@ -9,6 +9,7 @@ import re
 import time
 import hmac
 import hashlib
+import html
 from urllib.parse import parse_qsl
 from pathlib import Path
 from warraq import handle_warraq_update
@@ -149,9 +150,36 @@ DEVELOPER_NAME = os.environ.get(
     "DEVELOPER_NAME", "الوقّاد"
 ).strip() or "الوقّاد"
 DEVELOPER_CONTACT = os.environ.get(
-    "DEVELOPER_CONTACT",
-    "https://github.com/ALWAQAD-afk"
+    "DEVELOPER_CONTACT", ""
 ).strip()
+
+# معرّف تليجرام للمطوّر: تستخدمه /stats وتصل إليه رسائل /contact.
+DEVELOPER_CHAT_ID = os.environ.get(
+    "DEVELOPER_CHAT_ID", "7991076455"
+).strip()
+DEVELOPER_USERNAME = os.environ.get(
+    "DEVELOPER_USERNAME", ""
+).strip().lstrip("@")
+
+
+def developer_direct_link():
+    """رابط مباشر اختياري، يظهر بجانب /contact إن أُعدّ."""
+    if DEVELOPER_USERNAME:
+        return f"https://t.me/{DEVELOPER_USERNAME}"
+    return DEVELOPER_CONTACT
+
+
+def is_developer(user_id):
+    return bool(DEVELOPER_CHAT_ID) and str(user_id) == str(DEVELOPER_CHAT_ID)
+
+
+# التواصل يمرّ عبر البوت حتى لا تُنشر بيانات المطوّر الشخصية.
+# الانتظار في الذاكرة يكفي لأن الخدمة تعمل بعامل واحد (workers=1).
+_CONTACT_PENDING = {}
+_CONTACT_REPLIES = {}
+_CONTACT_LOCK = threading.Lock()
+CONTACT_WINDOW_SECONDS = 30 * 60
+CONTACT_MAX_CHARS = 3000
 
 
 def contributors_text():
@@ -1301,7 +1329,7 @@ def transcript_download_name(original_filename):
     return f"{stem}.txt"
 
 
-def telegram_send_message(chat_id, text, reply_markup=None):
+def telegram_send_message(chat_id, text, reply_markup=None, parse_mode=None):
     """Send a normal Telegram message from the transcriber bot."""
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
@@ -1315,6 +1343,8 @@ def telegram_send_message(chat_id, text, reply_markup=None):
             reply_markup,
             ensure_ascii=False
         )
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
 
     response = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -1542,6 +1572,298 @@ def log_transcription_failure(job_id):
     )
 
 
+CONTACT_INTRO = (
+    "📬 للتواصل مع مطوّر مفرّغ الوقّاد\n\n"
+    "قبل الإرسال، راعِ هذه الشروط:\n"
+    "1) اكتب رسالتك واضحة، ويفضّل في رسالة واحدة.\n"
+    "2) إن كان بلاغاً عن خلل، اذكر اسم الملف أو الأمر.\n"
+    "3) لا ترسل ملفات صوتية أو فيديو هنا؛ التفريغ في المحادثة نفسها.\n"
+    "4) لا ترسل كلمات مرور أو بيانات حساسة.\n"
+    "5) الردّ تطوّعي، وقد يتأخر حسب الوقت.\n\n"
+    "أرسل رسالتك الآن في الرسالة التالية.\n"
+    "للإلغاء: /cancel"
+)
+
+
+def _display_name(sender):
+    name = " ".join(
+        part for part in (
+            sender.get("first_name"),
+            sender.get("last_name")
+        ) if part
+    ).strip()
+    return name or "مستخدم"
+
+
+def _forward_contact(chat_id, user_id, sender, text):
+    """يوصل رسالة المستخدم إلى المطوّر مع إمكانية الردّ عليها."""
+    text = (text or "").strip()
+    if not text:
+        telegram_send_message(chat_id, "اكتب رسالتك نصاً، ثم أرسلها.")
+        return False
+
+    if not DEVELOPER_CHAT_ID:
+        telegram_send_message(
+            chat_id,
+            "⚠️ قناة التواصل غير مهيأة حالياً. حاول لاحقاً."
+        )
+        return False
+
+    name = html.escape(_display_name(sender))
+    username = (sender.get("username") or "").strip()
+    handle = f"@{html.escape(username)}" if username else "بلا اسم مستخدم"
+    try:
+        mention = f'<a href="tg://user?id={int(user_id)}">{name}</a>'
+    except (TypeError, ValueError):
+        mention = name
+
+    body = (
+        "📬 رسالة تواصل جديدة\n"
+        f"👤 {mention} ({handle})\n"
+        f"🆔 <code>{html.escape(str(user_id))}</code>\n\n"
+        f"{html.escape(text[:CONTACT_MAX_CHARS])}\n\n"
+        "↩️ ردّ على هذه الرسالة ليصل ردّك إلى المستخدم."
+    )
+
+    try:
+        forwarded_id = telegram_send_message(
+            DEVELOPER_CHAT_ID,
+            body,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"[CONTACT] forward failed: {e}", flush=True)
+        telegram_send_message(
+            chat_id,
+            "⚠️ تعذّر إرسال رسالتك الآن. حاول بعد قليل."
+        )
+        return False
+
+    if forwarded_id:
+        with _CONTACT_LOCK:
+            _CONTACT_REPLIES[str(forwarded_id)] = user_id
+            # لا نحتفظ بقائمة لا نهائية في الذاكرة.
+            if len(_CONTACT_REPLIES) > 500:
+                for old_key in list(_CONTACT_REPLIES)[:100]:
+                    _CONTACT_REPLIES.pop(old_key, None)
+
+    telegram_send_message(
+        chat_id,
+        "✅ وصلت رسالتك إلى المطوّر. شكراً لك، وسيصلك الردّ هنا إن شاء الله."
+    )
+    return True
+
+
+def handle_contact(chat_id, user_id, sender, argument):
+    """/contact ثم رسالة المستخدم تُمرَّر إلى المطوّر."""
+    if is_developer(user_id):
+        telegram_send_message(
+            chat_id,
+            "أنت المطوّر؛ رسائل /contact من المستخدمين تصل إليك هنا."
+        )
+        return
+
+    if argument:
+        with _CONTACT_LOCK:
+            _CONTACT_PENDING.pop(str(user_id), None)
+        _forward_contact(chat_id, user_id, sender, argument)
+        return
+
+    with _CONTACT_LOCK:
+        _CONTACT_PENDING[str(user_id)] = time.time()
+
+    telegram_send_message(chat_id, CONTACT_INTRO)
+
+
+def _consume_pending_contact(user_id):
+    """هل المستخدم في وضع كتابة رسالة تواصل؟"""
+    key = str(user_id)
+    with _CONTACT_LOCK:
+        started = _CONTACT_PENDING.pop(key, None)
+
+    if started is None:
+        return False
+
+    if time.time() - started > CONTACT_WINDOW_SECONDS:
+        telegram_send_message(
+            user_id,
+            "انتهت مهلة كتابة الرسالة. أرسل /contact من جديد."
+        )
+        return False
+
+    return True
+
+
+def handle_developer_reply(message, chat_id):
+    """ردّ المطوّر على رسالة مُمرَّرة يعود إلى صاحبها."""
+    replied = message.get("reply_to_message") or {}
+    key = str(replied.get("message_id") or "")
+
+    with _CONTACT_LOCK:
+        target = _CONTACT_REPLIES.get(key)
+
+    if not target:
+        return False
+
+    text = (message.get("text") or message.get("caption") or "").strip()
+    if not text:
+        telegram_send_message(
+            chat_id,
+            "اكتب الردّ نصاً حتى يصل للمستخدم."
+        )
+        return True
+
+    try:
+        telegram_send_message(
+            target,
+            "📬 ردّ من مطوّر مفرّغ الوقّاد:\n\n"
+            f"{text[:CONTACT_MAX_CHARS]}"
+        )
+        telegram_send_message(chat_id, "✅ أُرسل ردّك إلى المستخدم.")
+    except Exception as e:
+        print(f"[CONTACT] reply failed: {e}", flush=True)
+        telegram_send_message(
+            chat_id,
+            "⚠️ تعذّر إرسال الردّ. قد يكون المستخدم حظر البوت."
+        )
+
+    return True
+
+
+def handle_stats(chat_id, user_id):
+    """لوحة أرقام للمطوّر فقط، من قاعدة البيانات والطابور."""
+    if not is_developer(user_id):
+        telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
+        return
+
+    queue_stats = job_queue.stats()
+    lines = ["📊 إحصاءات مفرّغ الوقّاد", ""]
+
+    lines.append(
+        f"🧵 الطابور: يعمل الآن {queue_stats.get('running', 0)}، "
+        f"ينتظر {queue_stats.get('waiting', 0)}، "
+        f"العمال {queue_stats.get('workers', 0)}."
+    )
+
+    average_queue = queue_stats.get("average_seconds")
+    if average_queue:
+        lines.append(f"⏱️ متوسط مدة المهمة: {_format_duration(average_queue)}.")
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        COUNT(*) AS total,
+                        COUNT(*) FILTER (
+                            WHERE created_at > NOW() - INTERVAL '24 hours'
+                        ) AS last_day,
+                        COUNT(*) FILTER (
+                            WHERE created_at > NOW() - INTERVAL '7 days'
+                        ) AS last_week,
+                        COUNT(*) FILTER (
+                            WHERE data->>'status' = 'completed'
+                        ) AS completed,
+                        COUNT(*) FILTER (
+                            WHERE data->>'status' = 'failed'
+                        ) AS failed,
+                        COUNT(DISTINCT data->>'telegram_user_id') AS users,
+                        AVG(
+                            CASE
+                                WHEN data->>'processing_seconds'
+                                     ~ '^[0-9]+(\\.[0-9]+)?$'
+                                THEN (data->>'processing_seconds')::float
+                            END
+                        ) FILTER (
+                            WHERE data->>'status' = 'completed'
+                        ) AS avg_seconds
+                    FROM jobs
+                """)
+                summary = cur.fetchone() or {}
+
+                cur.execute("""
+                    SELECT
+                        COALESCE(NULLIF(data->>'engine', ''), 'غير معروف')
+                            AS engine,
+                        COUNT(*) AS count
+                    FROM jobs
+                    WHERE data->>'status' = 'completed'
+                    GROUP BY 1
+                    ORDER BY 2 DESC
+                    LIMIT 5
+                """)
+                engines = cur.fetchall()
+
+                cur.execute("""
+                    SELECT
+                        COUNT(*) AS count,
+                        LEFT(
+                            COALESCE(NULLIF(data->>'error', ''), 'غير معروف'),
+                            80
+                        ) AS reason
+                    FROM jobs
+                    WHERE data->>'status' = 'failed'
+                      AND created_at > NOW() - INTERVAL '7 days'
+                    GROUP BY 2
+                    ORDER BY 1 DESC
+                    LIMIT 4
+                """)
+                failures = cur.fetchall()
+
+        lines.append("")
+        lines.append(
+            f"📥 المهام: {summary.get('total') or 0} "
+            f"(اليوم {summary.get('last_day') or 0}، "
+            f"الأسبوع {summary.get('last_week') or 0})."
+        )
+        lines.append(
+            f"✅ مكتملة: {summary.get('completed') or 0} — "
+            f"❌ فاشلة: {summary.get('failed') or 0} — "
+            f"👥 مستخدمون: {summary.get('users') or 0}."
+        )
+
+        avg_seconds = summary.get("avg_seconds")
+        if avg_seconds:
+            lines.append(
+                f"⏱️ متوسط التفريغ: {_format_duration(avg_seconds)}."
+            )
+
+        if engines:
+            parts = [
+                f"{row.get('engine')}: {row.get('count')}"
+                for row in engines
+            ]
+            lines.append("⚙️ المحركات: " + "، ".join(parts) + ".")
+
+        if failures:
+            lines.append("")
+            lines.append("⚠️ أسباب الفشل (آخر 7 أيام):")
+            for row in failures:
+                lines.append(
+                    f"• {row.get('count')}× {row.get('reason')}"
+                )
+
+    except Exception as e:
+        print(f"[STATS] jobs query failed: {e}", flush=True)
+        lines.append("")
+        lines.append("⚠️ تعذّر قراءة إحصاءات المهام من قاعدة البيانات.")
+
+    try:
+        overall = transcript_store.overall_stats() or {}
+        if overall:
+            lines.append("")
+            lines.append(
+                f"🗂️ التفريغات المحفوظة: "
+                f"{overall.get('transcripts') or 0} — "
+                f"آخر 24 ساعة: {overall.get('last_day') or 0} — "
+                f"مستخدمون: {overall.get('users') or 0}."
+            )
+    except Exception as e:
+        print(f"[STATS] transcript query failed: {e}", flush=True)
+
+    telegram_send_message(chat_id, "\n".join(lines))
+
+
 def handle_transcriber_chat_update(update):
     """الملفات تُفرّغ مباشرة، والأوامر تُخدم، وغير ذلك يُتجاهل بهدوء."""
     message = update.get("message")
@@ -1556,12 +1878,29 @@ def handle_transcriber_chat_update(update):
 
     user_id = sender.get("id")
 
+    # ردّ المطوّر على رسالة تواصل يعود لصاحب الرسالة.
+    if is_developer(user_id) and message.get("reply_to_message"):
+        if handle_developer_reply(message, chat_id):
+            return
+
     attachment = extract_attachment(message)
     if attachment:
         handle_bot_attachment(chat, sender, attachment)
         return
 
     raw_text = (message.get("text") or "").strip()
+
+    # رسالة عادية بعد /contact تُمرَّر إلى المطوّر بدل ردّ البوت المعتاد.
+    if (
+        chat.get("type") == "private"
+        and raw_text
+        and not raw_text.startswith("/")
+        and not is_developer(user_id)
+        and _consume_pending_contact(user_id)
+    ):
+        _forward_contact(chat_id, user_id, sender, raw_text)
+        return
+
     if not raw_text.startswith("/"):
         if chat.get("type") == "private" and (
             raw_text or message.get("photo") or message.get("sticker")
@@ -1583,6 +1922,11 @@ def handle_transcriber_chat_update(update):
     command, _, argument = raw_text.partition(" ")
     command = command.split("@", 1)[0].lower()
     argument = argument.strip()
+
+    # أي أمر آخر ينهي وضع كتابة رسالة التواصل، فلا تُمرَّر رسالة لاحقة بالخطأ.
+    if command != "/contact":
+        with _CONTACT_LOCK:
+            _CONTACT_PENDING.pop(str(user_id), None)
 
     keyboard = {
         "inline_keyboard": [[{
@@ -1610,19 +1954,36 @@ def handle_transcriber_chat_update(update):
             "🔍 /find كلمة — البحث في تفريغاتك.\n"
             "🔍 /find — آخر تفريغاتك.\n"
             "🗂️ كل تفريغ يُحفظ في أرشيفك الخاص.\n"
-            "👨‍💻 /about — المطوّر والمساهمون ووسيلة التواصل.\n\n"
+            "👨‍💻 /about — المطوّر والمساهمون.\n"
+            "📬 /contact — التواصل مع المطوّر.\n\n"
             "الملفات الأكبر من 20MB تُرفع من صفحة الرفع أدناه."
         )
     elif command == "/about":
+        direct = developer_direct_link()
         reply = (
             "🎙️ مفرّغ الوقّاد\n\n"
             f"👨‍💻 المطوّر: {DEVELOPER_NAME}\n"
-            f"🤝 المساهمون: {contributors_text()}\n"
-            f"📬 للتواصل والملاحظات: {DEVELOPER_CONTACT}\n\n"
-            "🔐 تفريغاتك محفوظة في أرشيفك الخاص، "
-            "ولا يراها مستخدم آخر.\n"
-            "🗑️ لطلب حذف تفريغ، راسل المطوّر."
+            f"🤝 المساهمون: {contributors_text()}\n\n"
+            "📬 للتواصل والملاحظات: أرسل /contact ثم رسالتك، "
+            "وستصل إلى المطوّر مباشرة."
         )
+        if direct:
+            reply += f"\n🔗 أو مباشرة: {direct}"
+        reply += (
+            "\n\n🔐 تفريغاتك محفوظة في أرشيفك الخاص، "
+            "ولا يراها مستخدم آخر.\n"
+            "🗑️ لطلب حذف تفريغ، استخدم /contact."
+        )
+    elif command == "/contact":
+        handle_contact(chat_id, user_id, sender, argument)
+        return
+    elif command == "/cancel":
+        with _CONTACT_LOCK:
+            _CONTACT_PENDING.pop(str(user_id), None)
+        reply = "أُلغي وضع كتابة رسالة التواصل."
+    elif command == "/stats":
+        handle_stats(chat_id, user_id)
+        return
     elif command == "/find":
         handle_find(chat_id, user_id, argument)
         return
