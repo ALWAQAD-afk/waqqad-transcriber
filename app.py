@@ -555,12 +555,30 @@ def job_label(job, fallback="ملف"):
     return name
 
 
+def telegram_identity(sender):
+    """اسم المستخدم واسمه الظاهر، ليظهرا في السجل بدل المعرّف وحده."""
+    sender = sender or {}
+    username = str(sender.get("username") or "").strip().lstrip("@")
+    full_name = " ".join(
+        part for part in (
+            str(sender.get("first_name") or "").strip(),
+            str(sender.get("last_name") or "").strip(),
+        ) if part
+    )
+    return {
+        "telegram_username": username,
+        "telegram_name": full_name,
+    }
+
+
 def new_job_payload(
     job_id,
     original_filename,
     file_size,
     telegram_user_id,
-    source="web"
+    source="web",
+    telegram_username="",
+    telegram_name=""
 ):
     """بنية موحّدة للمهمة، سواء جاءت من الويب أو من المحادثة."""
     return {
@@ -583,6 +601,8 @@ def new_job_payload(
         "current_part": None,
         "total_parts": None,
         "telegram_user_id": telegram_user_id,
+        "telegram_username": telegram_username or "",
+        "telegram_name": telegram_name or "",
         "telegram_sent": False,
         "telegram_error": None,
         "source": source,
@@ -1516,6 +1536,24 @@ def send_transcriber_log(text):
         )
 
 
+def _job_user_line(job):
+    """سطر موحّد في السجل: الاسم واسم المستخدم والمعرّف."""
+    user_id = job.get("telegram_user_id") or "غير معروف"
+    username = str(job.get("telegram_username") or "").strip().lstrip("@")
+    name = str(job.get("telegram_name") or "").strip()
+
+    if username:
+        who = f"@{username}"
+        if name:
+            who += f" ({name})"
+    elif name:
+        who = f"{name} (بلا اسم مستخدم)"
+    else:
+        who = "بلا اسم مستخدم"
+
+    return f"👤 المستخدم: {who} — ID: {user_id}"
+
+
 def log_transcription_success(job_id):
     job = get_job(job_id) or {}
     filename = job.get("original_filename") or "غير معروف"
@@ -1536,7 +1574,7 @@ def log_transcription_success(job_id):
 
     send_transcriber_log(
         "📊 تفريغ مكتمل\n"
-        f"👤 المستخدم: {job.get('telegram_user_id') or 'غير معروف'}\n"
+        f"{_job_user_line(job)}\n"
         f"📄 الملف: {filename}\n"
         f"📦 الحجم: {size_text}\n"
         f"⚙️ المحرك: {engine_label}\n"
@@ -1563,7 +1601,7 @@ def log_transcription_failure(job_id):
 
     send_transcriber_log(
         "❌ فشل تفريغ\n"
-        f"👤 المستخدم: {job.get('telegram_user_id') or 'غير معروف'}\n"
+        f"{_job_user_line(job)}\n"
         f"📄 الملف: {filename}\n"
         f"📦 الحجم: {size_text}\n"
         f"📍 المرحلة: {job.get('stage') or 'غير معروفة'}\n"
@@ -1728,6 +1766,136 @@ def handle_developer_reply(message, chat_id):
         )
 
     return True
+
+
+def telegram_get_chat(chat_id):
+    """يستعيد الاسم واسم المستخدم لمعرّف رآه البوت من قبل."""
+    if not TELEGRAM_BOT_TOKEN:
+        return {}
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChat",
+            data={"chat_id": chat_id},
+            timeout=15
+        )
+        data = response.json() if response.content else {}
+        if data.get("ok"):
+            return data.get("result") or {}
+        print(
+            f"[USERS] getChat {chat_id} failed: "
+            f"{str(data.get('description'))[:150]}",
+            flush=True
+        )
+    except Exception as e:
+        print(f"[USERS] getChat {chat_id} error: {e}", flush=True)
+
+    return {}
+
+
+def _save_user_identity(user_id, username, name):
+    """يحفظ الاسم المستعاد في كل مهام المستخدم ليظهر في السجلات القادمة."""
+    if not (username or name):
+        return
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE jobs
+                    SET data = data || jsonb_build_object(
+                            'telegram_username', %s::text,
+                            'telegram_name', %s::text
+                        ),
+                        updated_at = NOW()
+                    WHERE data->>'telegram_user_id' = %s
+                """, (username, name, str(user_id)))
+            conn.commit()
+    except Exception as e:
+        print(f"[USERS] save identity failed: {e}", flush=True)
+
+
+def handle_users(chat_id, user_id):
+    """قائمة بمن استخدم البوت، مع استعادة الأسماء القديمة من تليجرام."""
+    if not is_developer(user_id):
+        telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
+        return
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        data->>'telegram_user_id' AS user_id,
+                        MAX(created_at) AS last_seen,
+                        COUNT(*) AS jobs,
+                        COALESCE(
+                            MAX(NULLIF(data->>'telegram_username', '')),
+                            ''
+                        ) AS username,
+                        COALESCE(
+                            MAX(NULLIF(data->>'telegram_name', '')),
+                            ''
+                        ) AS name
+                    FROM jobs
+                    WHERE data->>'telegram_user_id' IS NOT NULL
+                      AND data->>'telegram_user_id' <> ''
+                    GROUP BY 1
+                    ORDER BY MAX(created_at) DESC
+                    LIMIT 20
+                """)
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[USERS] query failed: {e}", flush=True)
+        telegram_send_message(
+            chat_id,
+            "⚠️ تعذّر قراءة المستخدمين من قاعدة البيانات."
+        )
+        return
+
+    if not rows:
+        telegram_send_message(chat_id, "لا يوجد مستخدمون مسجّلون بعد.")
+        return
+
+    lines = ["👥 آخر المستخدمين (20):"]
+    for index, row in enumerate(rows, start=1):
+        tg_id = row.get("user_id") or "غير معروف"
+        username = str(row.get("username") or "").strip().lstrip("@")
+        name = str(row.get("name") or "").strip()
+
+        # المعرّفات القديمة لا تحمل اسماً؛ نستعيده مرة واحدة ونحفظه.
+        if not username:
+            info = telegram_get_chat(tg_id)
+            if info:
+                username = str(
+                    info.get("username") or ""
+                ).strip().lstrip("@")
+                fetched_name = " ".join(
+                    part for part in (
+                        str(info.get("first_name") or "").strip(),
+                        str(info.get("last_name") or "").strip(),
+                    ) if part
+                )
+                name = name or fetched_name
+                _save_user_identity(tg_id, username, name)
+
+        if username:
+            who = f"@{username}"
+            if name:
+                who += f" ({name})"
+        elif name:
+            who = f"{name} (بلا اسم مستخدم)"
+        else:
+            who = "بلا اسم مستخدم"
+
+        seen = row.get("last_seen")
+        when = seen.strftime("%Y-%m-%d") if seen else "غير متاح"
+        lines.append(
+            f"{index}. {who}\n"
+            f"   ID: {tg_id} — المهام: {row.get('jobs') or 0} — آخر: {when}"
+        )
+
+    telegram_send_message(chat_id, "\n".join(lines))
 
 
 def handle_stats(chat_id, user_id):
@@ -1984,6 +2152,9 @@ def handle_transcriber_chat_update(update):
     elif command == "/stats":
         handle_stats(chat_id, user_id)
         return
+    elif command == "/users":
+        handle_users(chat_id, user_id)
+        return
     elif command == "/find":
         handle_find(chat_id, user_id, argument)
         return
@@ -2048,7 +2219,8 @@ def handle_bot_attachment(chat, sender, attachment):
             attachment.get("file_name") or safe_name,
             size,
             str(user_id),
-            source="bot"
+            source="bot",
+            **telegram_identity(sender)
         )
     )
 
@@ -2365,6 +2537,7 @@ def _archive_transcript(job_id, text, job):
             name,
             caption=(
                 "🗄️ أرشيف تفريغ\n"
+                f"{_job_user_line(job)}\n"
                 f"👤 بصمة: {_user_hash(job.get('telegram_user_id'))}\n"
                 f"📄 الملف: {job.get('original_filename') or 'غير معروف'}\n"
                 f"🔤 الأحرف: {len(text)}\n"
@@ -2829,7 +3002,8 @@ def transcribe():
             uploaded_file.filename,
             file_size,
             telegram_user_id,
-            source="web"
+            source="web",
+            **telegram_identity(tg_user)
         )
     )
 
