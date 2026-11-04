@@ -468,14 +468,21 @@ def _yt_version():
 
 def log_ytdlp_runtime():
     """سجل بدء التشغيل: نسخة yt-dlp وتوفر بيئة JS (دنو)."""
+    print(f"[YTDLP] yt-dlp {_yt_version()}؛ JS runtime: {js_runtime_state()}",
+          flush=True)
+
+
+def js_runtime_state():
+    """حالة بيئة JS على الخادم؛ dениو مفعّل افتراضيًا في yt-dlp الحديث."""
     import shutil
 
     deno = shutil.which("deno")
+    if deno:
+        return f"deno ({deno})"
     node = shutil.which("node")
-    runtime = f"deno ({deno})" if deno else (
-        f"node ({node}، غير مفعّل افتراضيًا)" if node else "غير متوفر"
-    )
-    print(f"[YTDLP] yt-dlp {_yt_version()}؛ JS runtime: {runtime}", flush=True)
+    if node:
+        return f"node ({node}؛ غير مفعّل تلقائيًا في yt-dlp)"
+    return "غير متوفر — ستعطي يوتيوب صيغًا ناقصة"
 
 
 def inspect_youtube(url, destination_dir, cookies_text=None):
