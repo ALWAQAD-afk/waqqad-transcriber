@@ -331,11 +331,60 @@ def _youtube_failure(message):
     return error
 
 
-def _youtube_cookies_file(destination_dir):
+def validate_cookies_text(text):
+    """يتحقق من ملف كوكيز Netscape ويعدّ سطور يوتيوب الصالحة."""
+    if not isinstance(text, str) or not text.strip():
+        raise UrlDownloadError("ملف الكوكيز فارغ.")
+
+    if "\x00" in text:
+        raise UrlDownloadError("الملف يبدو ثنائيًا وليس ملف كوكيز نصيًا.")
+
+    count = 0
+    for line in text.splitlines():
+        candidate = (
+            line[len("#HttpOnly_"):]
+            if line.startswith("#HttpOnly_")
+            else line
+        )
+        if not candidate or candidate.startswith("#"):
+            continue
+        if "youtube.com" not in candidate:
+            continue
+        if len(candidate.split("\t")) < 7:
+            continue
+        count += 1
+
+    if count:
+        return count
+
+    lower = text.lower()
+    if (
+        "netscape http cookie file" not in lower
+        and "# http cookie file" not in lower
+    ):
+        raise UrlDownloadError(
+            "الملف ليس بصيغة كوكيز Netscape. "
+            "صدّره من المتصفح كملف cookies.txt."
+        )
+
+    raise UrlDownloadError(
+        "الملف لا يحتوي كوكيز يوتيوب صالحة. "
+        "تأكد من تسجيل الدخول إلى youtube.com قبل التصدير."
+    )
+
+
+def _youtube_cookies_file(destination_dir, cookies_text=None):
     """يعيد (مسار الكوكيز، هل هو مؤقت؟).
 
-    يدعم ملفًا على الخادم، أو نص base64 في متغيّر بيئة (أنسب لـ Render).
+    الأولوية: النص المحفوظ في قاعدة البيانات، ثم ملف على الخادم،
+    ثم نص base64 في متغيّر بيئة (أنسب لـ Render).
     """
+    if cookies_text and cookies_text.strip():
+        path = destination_dir / ".youtube-cookies.txt"
+        path.write_text(cookies_text, encoding="utf-8")
+        path.chmod(0o600)
+        return path, True
+
     existing = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
     if existing and Path(existing).is_file():
         return Path(existing), False
@@ -390,7 +439,7 @@ def _youtube_options(destination_dir, max_bytes, cookies_file=None, clients=None
     return options
 
 
-def _download_youtube(url, destination_dir, max_bytes):
+def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
     try:
         import yt_dlp
     except ImportError as e:
@@ -398,7 +447,10 @@ def _download_youtube(url, destination_dir, max_bytes):
             "دعم يوتيوب غير مثبّت على الخادم."
         ) from e
 
-    cookies_file, temporary_cookies = _youtube_cookies_file(destination_dir)
+    cookies_file, temporary_cookies = _youtube_cookies_file(
+        destination_dir,
+        cookies_text
+    )
     info = None
     last_message = ""
 
@@ -459,7 +511,7 @@ def display_name_for_url(url):
     return name or "رابط خارجي"
 
 
-def download_url(url, destination_dir, max_bytes):
+def download_url(url, destination_dir, max_bytes, cookies_text=None):
     """ينزّل الرابط ويعيد (المسار، الحجم، الاسم الظاهر)."""
     if not is_url(url):
         raise UnsupportedUrl("الرابط غير صالح.")
@@ -470,5 +522,10 @@ def download_url(url, destination_dir, max_bytes):
     max_bytes = max(1, int(max_bytes))
 
     if is_youtube(url):
-        return _download_youtube(url, destination, max_bytes)
+        return _download_youtube(
+            url,
+            destination,
+            max_bytes,
+            cookies_text=cookies_text
+        )
     return _download_direct(url, destination, max_bytes)

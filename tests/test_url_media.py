@@ -178,6 +178,45 @@ class TestYoutubeErrors(unittest.TestCase):
         self.assertEqual(reason, "first line second line with spaces")
 
 
+class TestCookiesText(unittest.TestCase):
+    def test_valid_youtube_cookies(self):
+        text = (
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n"
+            "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tHSID\tvalue\n"
+        )
+        self.assertEqual(url_media.validate_cookies_text(text), 2)
+
+    def test_rejects_non_cookie_file(self):
+        with self.assertRaises(url_media.UrlDownloadError):
+            url_media.validate_cookies_text("<html>not cookies</html>")
+
+    def test_rejects_cookies_without_youtube(self):
+        text = (
+            "# Netscape HTTP Cookie File\n"
+            ".example.com\tTRUE\t/\tTRUE\t0\tk\tv\n"
+        )
+        with self.assertRaises(url_media.UrlDownloadError):
+            url_media.validate_cookies_text(text)
+
+    def test_rejects_empty(self):
+        with self.assertRaises(url_media.UrlDownloadError):
+            url_media.validate_cookies_text("")
+
+    def test_cookies_text_is_written_for_job(self):
+        text = (
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n"
+        )
+        with TemporaryDirectory() as temp:
+            path, temporary = url_media._youtube_cookies_file(
+                Path(temp), text
+            )
+            self.assertTrue(temporary)
+            self.assertEqual(path.read_text(encoding="utf-8"), text)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+
 class TestYoutubeCookies(unittest.TestCase):
     def test_missing_cookies_returns_none(self):
         with mock.patch.dict(

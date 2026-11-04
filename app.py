@@ -402,7 +402,7 @@ def _safe_upload_name(original_name):
 
 
 def init_db():
-    """إنشاء جدول المهام إن لم يكن موجودًا."""
+    """إنشاء جدول المهام والإعدادات إن لم تكن موجودة."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -413,8 +413,63 @@ def init_db():
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
             conn.commit()
-    print("[DB] Jobs table ready", flush=True)
+    print("[DB] Jobs and settings tables ready", flush=True)
+
+
+YOUTUBE_COOKIES_KEY = "youtube_cookies"
+MAX_COOKIES_BYTES = 512 * 1024
+
+
+def set_setting(key, value):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO app_settings (key, value)
+                VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value,
+                    updated_at = NOW()
+                """,
+                (key, value)
+            )
+            conn.commit()
+
+
+def get_setting(key):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM app_settings WHERE key = %s",
+                (key,)
+            )
+            row = cur.fetchone()
+            return row["value"] if row else None
+
+
+def get_setting_row(key):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT value, updated_at FROM app_settings WHERE key = %s",
+                (key,)
+            )
+            return cur.fetchone()
+
+
+def delete_setting(key):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM app_settings WHERE key = %s", (key,))
+            conn.commit()
 
 def fail_orphaned_jobs():
     """المهام التي كانت تعمل قبل إعادة التشغيل لن تكتمل."""
@@ -2046,6 +2101,117 @@ def handle_stats(chat_id, user_id):
     telegram_send_message(chat_id, "\n".join(lines))
 
 
+def _is_cookies_document(message):
+    document = message.get("document") or {}
+    name = (document.get("file_name") or "").strip().lower()
+    return bool(document.get("file_id")) and name.endswith(".txt")
+
+
+def handle_cookies_upload(message, chat_id):
+    """يستقبل cookies.txt من المطوّر ويحفظه لاستخدامه في يوتيوب."""
+    file_id = (message.get("document") or {}).get("file_id")
+    work_dir = Path("/tmp") / f"waqqad_cookies_{uuid.uuid4().hex}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    target = work_dir / "cookies.txt"
+
+    try:
+        download_telegram_file(
+            TELEGRAM_BOT_TOKEN,
+            file_id,
+            target,
+            max_bytes=MAX_COOKIES_BYTES
+        )
+        raw = target.read_bytes()
+        if len(raw) > MAX_COOKIES_BYTES:
+            raise FileTooLarge(len(raw), MAX_COOKIES_BYTES)
+
+        text = raw.decode("utf-8-sig")
+        count = url_media.validate_cookies_text(text)
+        set_setting(YOUTUBE_COOKIES_KEY, text)
+
+        telegram_send_message(
+            chat_id,
+            f"✅ حُفظت كوكيز يوتيوب ({count} سطرًا).\n"
+            "أعد إرسال الرابط الآن، وسأستخدمها تلقائيًا.\n\n"
+            "🔐 محتواها لا يظهر في المحادثة."
+        )
+        print(f"[COOKIES] saved {count} youtube cookie lines", flush=True)
+    except FileTooLarge:
+        telegram_send_message(
+            chat_id,
+            f"⚠️ الملف أكبر من الحد ({MAX_COOKIES_BYTES // 1024}KB). "
+            "أرسل ملف الكوكيز الأصلي دون تعديل."
+        )
+    except UnicodeDecodeError:
+        telegram_send_message(
+            chat_id,
+            "⚠️ الملف ليس نصًا صالحًا. أرسل cookies.txt كما صدّرته من المتصفح."
+        )
+    except DownloadFailed as e:
+        print(f"[COOKIES] download failed: {e}", flush=True)
+        telegram_send_message(
+            chat_id,
+            "⚠️ تعذّر تنزيل الملف من تليجرام. أعد إرساله."
+        )
+    except url_media.UrlError as e:
+        telegram_send_message(chat_id, f"⚠️ {e}")
+    except Exception as e:
+        print(
+            f"[COOKIES] unexpected error: {type(e).__name__}: {e}",
+            flush=True
+        )
+        telegram_send_message(
+            chat_id,
+            "⚠️ حدث خطأ غير متوقع أثناء حفظ الكوكيز. أعد المحاولة."
+        )
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def handle_cookies_command(chat_id, user_id, argument):
+    if not is_developer(user_id):
+        telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
+        return
+
+    if argument.strip().lower() in ("clear", "delete", "حذف"):
+        delete_setting(YOUTUBE_COOKIES_KEY)
+        telegram_send_message(
+            chat_id,
+            "🗑️ حُذفت كوكيز يوتيوب. "
+            "أرسل ملف cookies.txt جديدًا عند الحاجة."
+        )
+        return
+
+    row = get_setting_row(YOUTUBE_COOKIES_KEY)
+    if not row:
+        telegram_send_message(
+            chat_id,
+            "🕓 لا توجد كوكيز يوتيوب محفوظة.\n"
+            "أرسل ملف cookies.txt كملف مستند في هذه المحادثة."
+        )
+        return
+
+    try:
+        count = url_media.validate_cookies_text(row.get("value") or "")
+    except url_media.UrlError:
+        count = 0
+
+    updated = row.get("updated_at")
+    when = (
+        updated.strftime("%Y-%m-%d %H:%M")
+        if hasattr(updated, "strftime")
+        else str(updated or "")
+    )
+
+    telegram_send_message(
+        chat_id,
+        f"✅ كوكيز يوتيوب محفوظة ({count} سطرًا).\n"
+        f"🕓 آخر تحديث: {when}\n\n"
+        "للتحديث: أرسل ملف cookies.txt جديدًا.\n"
+        "للحذف: /cookies clear"
+    )
+
+
 def handle_transcriber_chat_update(update):
     """الملفات تُفرّغ مباشرة، والأوامر تُخدم، وغير ذلك يُتجاهل بهدوء."""
     message = update.get("message")
@@ -2064,6 +2230,11 @@ def handle_transcriber_chat_update(update):
     if is_developer(user_id) and message.get("reply_to_message"):
         if handle_developer_reply(message, chat_id):
             return
+
+    # ملف cookies.txt من المطوّر يُحفظ لتفريغ روابط يوتيوب.
+    if is_developer(user_id) and _is_cookies_document(message):
+        handle_cookies_upload(message, chat_id)
+        return
 
     attachment = extract_attachment(message)
     if attachment:
@@ -2178,6 +2349,9 @@ def handle_transcriber_chat_update(update):
         return
     elif command == "/users":
         handle_users(chat_id, user_id)
+        return
+    elif command == "/cookies":
+        handle_cookies_command(chat_id, user_id, argument)
         return
     elif command == "/find":
         handle_find(chat_id, user_id, argument)
@@ -2354,10 +2528,17 @@ def run_url_job(job_id, url, destination, notify=True):
             notify
         )
 
+        try:
+            cookies_text = get_setting(YOUTUBE_COOKIES_KEY)
+        except Exception as e:
+            print(f"[COOKIES] read failed: {e}", flush=True)
+            cookies_text = None
+
         media_path, size, display_name = url_media.download_url(
             url,
             destination,
-            MAX_URL_BYTES
+            MAX_URL_BYTES,
+            cookies_text=cookies_text
         )
 
         update_job(
