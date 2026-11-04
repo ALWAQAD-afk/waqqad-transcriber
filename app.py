@@ -1609,6 +1609,10 @@ def log_transcription_failure(job_id):
     if len(error) > 1200:
         error = error[:1200] + "…"
 
+    detail = str(job.get("error_detail") or "").strip()
+    if detail:
+        error += f"\n🔧 التفاصيل: {detail[:600]}"
+
     send_transcriber_log(
         "❌ فشل تفريغ\n"
         f"{_job_user_line(job)}\n"
@@ -2323,12 +2327,13 @@ def _url_status(job_id, text, notify):
         print(f"[URL STATUS] {job_id}: {e}", flush=True)
 
 
-def _fail_url_job(job_id, label, reason, notify, user_message):
+def _fail_url_job(job_id, label, reason, notify, user_message, detail=""):
     update_job(
         job_id,
         status="failed",
         stage="error",
-        error=str(reason)
+        error=str(reason),
+        error_detail=str(detail or "")[:600] or None
     )
     log_transcription_failure(job_id)
     _url_status(job_id, user_message, notify)
@@ -2397,7 +2402,8 @@ def run_url_job(job_id, url, destination, notify=True):
             label,
             f"url download failed: {e}",
             notify,
-            f"❌ {label}: تعذّر تنزيل الرابط.\n{e}"
+            f"❌ {label}: تعذّر تنزيل الرابط.\n{e}",
+            detail=getattr(e, "detail", "")
         )
     except Exception as e:
         print(
@@ -2410,8 +2416,12 @@ def run_url_job(job_id, url, destination, notify=True):
             str(e),
             notify,
             f"❌ {label}: حدث خطأ غير متوقع أثناء معالجة الرابط.\n"
-            "أعد المحاولة، وإن تكرر فأبلغنا عبر /contact."
+            "أعد المحاولة، وإن تكرر فأبلغنا عبر /contact.",
+            detail=f"{type(e).__name__}: {e}"
         )
+    finally:
+        # الملف المنزَّل قد يبلغ 150MB، فلا نُبقيه بعد النجاح أو الفشل.
+        shutil.rmtree(destination.parent, ignore_errors=True)
 
 
 def handle_bot_url(chat, sender, url):

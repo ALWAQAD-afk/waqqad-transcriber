@@ -1,3 +1,5 @@
+import base64
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -145,6 +147,83 @@ class TestDirectDownload(unittest.TestCase):
                         1000
                     )
                 self.assertEqual(list(Path(temp).iterdir()), [])
+
+
+class TestYoutubeErrors(unittest.TestCase):
+    def test_bot_check_has_clear_message_and_detail(self):
+        error = url_media._youtube_failure(
+            "ERROR: [youtube] abc: Sign in to confirm you're not a bot. "
+            "Use --cookies-from-browser or --cookies for the authentication."
+        )
+        self.assertIsInstance(error, url_media.UrlDownloadError)
+        self.assertIn("فحص تحقق", str(error))
+        self.assertIn("not a bot", error.detail)
+
+    def test_unavailable_video_is_explained(self):
+        error = url_media._youtube_failure(
+            "ERROR: [youtube] abc: Video unavailable"
+        )
+        self.assertIn("غير متاح", str(error))
+
+    def test_oversize_stays_oversize(self):
+        error = url_media._youtube_failure(
+            "ERROR: File is larger than max-filesize"
+        )
+        self.assertIsInstance(error, url_media.UrlTooLarge)
+
+    def test_short_reason_is_one_line(self):
+        reason = url_media._short_reason(
+            "ERROR: first line\nsecond line   with spaces"
+        )
+        self.assertEqual(reason, "first line second line with spaces")
+
+
+class TestYoutubeCookies(unittest.TestCase):
+    def test_missing_cookies_returns_none(self):
+        with mock.patch.dict(
+            os.environ,
+            {"YTDLP_COOKIES_FILE": "", "YTDLP_COOKIES_B64": ""},
+            clear=False,
+        ):
+            with TemporaryDirectory() as temp:
+                self.assertEqual(
+                    url_media._youtube_cookies_file(Path(temp)),
+                    (None, False)
+                )
+
+    def test_base64_cookies_are_written(self):
+        raw = b"# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tTRUE\t0\tk\tv\n"
+        encoded = base64.b64encode(raw).decode()
+        with mock.patch.dict(
+            os.environ,
+            {"YTDLP_COOKIES_FILE": "", "YTDLP_COOKIES_B64": encoded},
+            clear=False,
+        ):
+            with TemporaryDirectory() as temp:
+                path, temporary = url_media._youtube_cookies_file(Path(temp))
+                self.assertTrue(temporary)
+                self.assertEqual(path.read_bytes(), raw)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_invalid_base64_is_rejected(self):
+        with mock.patch.dict(
+            os.environ,
+            {"YTDLP_COOKIES_FILE": "", "YTDLP_COOKIES_B64": "not base64!!"},
+            clear=False,
+        ):
+            with TemporaryDirectory() as temp:
+                with self.assertRaises(url_media.UrlDownloadError):
+                    url_media._youtube_cookies_file(Path(temp))
+
+    def test_options_include_alternate_client(self):
+        with TemporaryDirectory() as temp:
+            options = url_media._youtube_options(
+                Path(temp), 1024, None, ("tv", "android_vr")
+            )
+            self.assertEqual(
+                options["extractor_args"]["youtube"]["player_client"],
+                ["tv", "android_vr"]
+            )
 
 
 class TestDisplayName(unittest.TestCase):
