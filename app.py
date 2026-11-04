@@ -2802,71 +2802,147 @@ def handle_cookies_upload(message, chat_id):
 
 
 def handle_ytinfo_command(chat_id, user_id, argument):
-    """فحص تشخيصي للمطوّر: الصيغ التي يقدمها يوتيوب لرابط من هذا الخادم."""
+    """فحص تشخيصي للمطوّر: سبر الصيغ عبر عملاء متعدد مع الكوكيز والبدون.
+
+    يعمل في خيط خلفي حتى لا يعلّق الويبهوك، ويعرض النتيجة كرسائل متتابعة.
+    """
     if not is_developer(user_id):
         telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
         return
 
     url = (argument or "").strip()
     if not url:
-        telegram_send_message(chat_id, "استخدم: /ytinfo <رابط يوتيوب>")
+        telegram_send_message(
+            chat_id,
+            "استخدم: /ytinfo <رابط يوتيوب>\n"
+            "سأفحص عدة عملاء مع الكوكيز والبدون؛ قد يستغرق حتى دقيقة."
+        )
         return
 
-    work_dir = Path("/tmp") / f"waqqad_ytinfo_{uuid.uuid4().hex}"
-    work_dir.mkdir(parents=True, exist_ok=True)
-    try:
+    def _sweep():
+        work_dir = Path("/tmp") / f"waqqad_ytinfo_{uuid.uuid4().hex}"
+        work_dir.mkdir(parents=True, exist_ok=True)
         try:
-            cookies_text = get_setting(YOUTUBE_COOKIES_KEY)
-        except Exception as e:
-            print(f"[YTINFO] cookies read failed: {e}", flush=True)
-            cookies_text = None
+            runtime = url_media.js_runtime_state()
+            try:
+                cookies_text = get_setting(YOUTUBE_COOKIES_KEY)
+            except Exception as e:
+                print(f"[YTINFO] cookies read failed: {e}", flush=True)
+                cookies_text = None
 
-        info = url_media.inspect_youtube(url, work_dir, cookies_text=cookies_text)
-        formats = (info or {}).get("formats") or []
-        audible = [
-            f for f in formats
-            if f.get("acodec") not in (None, "none")
-        ]
-        merged = [
-            f for f in formats
-            if f.get("acodec") not in (None, "none")
-            and f.get("vcodec") not in (None, "none")
-        ]
-        title = str((info or {}).get("title") or "بدون عنوان").strip()
-        cookies_state = "مع الكوكيز" if cookies_text else "بدون كوكيز"
+            probes = [
+                ("الافتراضي", None),
+                ("web_safari", ("web_safari",)),
+                ("tv_downgraded", ("tv_downgraded",)),
+                ("web", ("web",)),
+                ("web_embedded", ("web_embedded",)),
+                ("mweb", ("mweb",)),
+                ("android", ("android",)),
+                ("ios", ("ios",)),
+            ]
+            results = []
+            first_title = None
+            for label, clients in probes:
+                info, error = url_media.inspect_youtube(
+                    url,
+                    work_dir,
+                    cookies_text=cookies_text,
+                    clients=clients,
+                )
+                if error:
+                    results.append((f"🍪 {label}", f"خطأ: {error}"))
+                    continue
+                if first_title is None:
+                    first_title = str((info or {}).get("title") or "").strip()
+                formats = (info or {}).get("formats") or []
+                audible = [
+                    f for f in formats
+                    if f.get("acodec") not in (None, "none")
+                ]
+                results.append(
+                    (
+                        f"🍪 {label}",
+                        f"{len(formats)} صيغة — صوت: {len(audible)}"
+                    )
+                )
+                if audible:
+                    ids = ", ".join(
+                        str(f.get("format_id")) for f in audible[:5]
+                    )
+                    results.append((f"🍪 {label} — صيغ الصوت", ids))
 
-        lines = [
-            f"ℹ️ {title}",
-            f"🧾 نسخة yt-dlp: {url_media._yt_version()}"
-            f" — الكوكيز: {cookies_state}",
-            f"📀 الصيغ: {len(formats)}"
-            f" — تصلح للصوت فقط: {len(audible)}"
-            f" — مدمجة (صوت+صورة): {len(merged)}",
-            "",
-            "أول 10 صيغ:",
-        ]
-        for f in formats[:10]:
-            audio = "🔊" if f.get("acodec") not in (None, "none") else "🎥"
-            lines.append(
-                f"{audio} {f.get('format_id')} ({f.get('ext')}) "
-                f"صوت: {f.get('acodec')} صورة: {f.get('vcodec')}"
+            if cookies_text:
+                info, error = url_media.inspect_youtube(
+                    url,
+                    work_dir,
+                    cookies_text=None,
+                    clients=None,
+                )
+                if error:
+                    results.append(
+                        ("🚫 بدون كوكيز — الافتراضي", f"خطأ: {error}")
+                    )
+                else:
+                    formats = (info or {}).get("formats") or []
+                    audible = [
+                        f for f in formats
+                        if f.get("acodec") not in (None, "none")
+                    ]
+                    results.append(
+                        (
+                            "🚫 بدون كوكيز — الافتراضي",
+                            f"{len(formats)} صيغة — صوت: {len(audible)}"
+                        )
+                    )
+                    if audible:
+                        ids = ", ".join(
+                            str(f.get("format_id")) for f in audible[:5]
+                        )
+                        results.append(
+                            ("🚫 بدون كوكيز — صيغ الصوت", ids)
+                        )
+
+            title_part = f" — {first_title}" if first_title else ""
+            header = (
+                f"ℹ️ سبر: {url}{title_part}\n"
+                f"🧾 نسخة: {url_media._yt_version()}"
+                f" — 🖥️ بيئة JS: {runtime}\n"
+                f"🍪 الافتراضيات مع الكوكيز — 🚫 آخر سطر بدونها\n"
+                "------------------------------"
             )
+            lines = [header]
+            for label, summary in results:
+                lines.append(f"{label}: {summary}")
+            message = "\n".join(lines)
+            for start in range(0, len(message), 3800):
+                try:
+                    telegram_send_message(
+                        chat_id,
+                        message[start:start + 3800]
+                    )
+                except Exception as e:
+                    print(f"[YTINFO] send failed: {e}", flush=True)
+                    break
+            print(f"[YTINFO] sweep finished for {url}", flush=True)
+        except Exception as e:
+            print(f"[YTINFO] sweep failed: {e}", flush=True)
+            try:
+                telegram_send_message(
+                    chat_id,
+                    f"⚠️ فشل السبر: {url_media._short_reason(e)}"
+                )
+            except Exception:
+                pass
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
-        message = "\n".join(lines)
-        telegram_send_message(
-            chat_id,
-            message if len(message) < 3900 else message[:3900]
-        )
-        print(f"[YTINFO] {url} -> {len(formats)} formats", flush=True)
-    except Exception as e:
-        print(f"[YTINFO] inspect failed: {e}", flush=True)
-        telegram_send_message(
-            chat_id,
-            f"⚠️ فشل الفحص: {url_media._short_reason(e)}"
-        )
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
-
+    thread = threading.Thread(
+        target=_sweep,
+        name="ytinfo-sweep",
+        daemon=True
+    )
+    thread.start()
+    print(f"[YTINFO] sweep started for {url}", flush=True)
 
 def handle_cookies_command(chat_id, user_id, argument):
     if not is_developer(user_id):

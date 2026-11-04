@@ -296,6 +296,11 @@ BOT_CHECK_HINTS = (
 YOUTUBE_ALT_CLIENTS = ("tv", "web_safari", "android_vr")
 YOUTUBE_LAST_CLIENTS = ("tv_downgraded", "android_vr", "ios")
 
+# آخر محاولة من غير الكوكيز إن رفضت يوتيوب كل المحاولات بالكوكيز.
+# من دون كوكيز يستخدم yt-dlp تلقائيًا عملاء لا يحتاجون حسابًا، وقد
+# تمنح صيغًا من عنوان الخادم بعد حل التحدي الجديد (بيئة JS).
+YOUTUBE_BARE_CLIENTS = ("android_vr", "web_safari", "ios")
+
 
 def _short_reason(error):
     """سطر قصير من خطأ yt-dlp يصلح للسجلّات."""
@@ -468,18 +473,29 @@ def _yt_version():
 
 def log_ytdlp_runtime():
     """سجل بدء التشغيل: نسخة yt-dlp وتوفر بيئة JS (دنو)."""
+    print(f"[YTDLP] yt-dlp {_yt_version()}؛ JS runtime: {js_runtime_state()}",
+          flush=True)
+
+
+def js_runtime_state():
+    """حالة بيئة JS على الخادم؛ دنو مفعّل افتراضيًا في yt-dlp الحديث."""
     import shutil
 
     deno = shutil.which("deno")
+    if deno:
+        return f"deno ({deno})"
     node = shutil.which("node")
-    runtime = f"deno ({deno})" if deno else (
-        f"node ({node}، غير مفعّل افتراضيًا)" if node else "غير متوفر"
-    )
-    print(f"[YTDLP] yt-dlp {_yt_version()}؛ JS runtime: {runtime}", flush=True)
+    if node:
+        return f"node ({node}؛ غير مفعّل تلقائيًا في yt-dlp)"
+    return "غير متوفر — ستعطي يوتيوب صيغًا ناقصة"
 
 
-def inspect_youtube(url, destination_dir, cookies_text=None):
-    """فحص للمطوّر: ما الصيغ التي يقدمها يوتيوب من هذا الخادم فعلًا؟"""
+def inspect_youtube(url, destination_dir, cookies_text=None, clients=None):
+    """فحص للمطوّر: ما الصيغ التي يقدمها يوتيوب من هذا الخادم فعلًا؟
+
+    ``clients=None`` يستخدم العملاء الافتراضيين، وإلا تُفرض القائمة.
+    يعيد (المعلومات أو None، ورسالة الخطأ أو "").
+    """
     import yt_dlp
 
     cookies_file, temporary_cookies = _youtube_cookies_file(
@@ -490,11 +506,14 @@ def inspect_youtube(url, destination_dir, cookies_text=None):
         Path(destination_dir),
         10_000_000_000,
         cookies_file,
+        clients,
     )
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             # process=False: قائمة الصيغ قبل تطبيق المحدد bestaudio/best.
-            return ydl.extract_info(url, download=False, process=False)
+            return ydl.extract_info(url, download=False, process=False), ""
+    except Exception as e:
+        return None, _short_reason(e)
     finally:
         if temporary_cookies and cookies_file:
             cookies_file.unlink(missing_ok=True)
@@ -516,13 +535,25 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
     info = None
     last_message = ""
 
+    cookie_attempts = (None, YOUTUBE_ALT_CLIENTS, YOUTUBE_LAST_CLIENTS)
+    bare_attempt = YOUTUBE_BARE_CLIENTS if cookies_text else None
+    attempts = list(cookie_attempts)
+    if bare_attempt:
+        attempts.append(bare_attempt)
+
     try:
-        for clients in (None, YOUTUBE_ALT_CLIENTS, YOUTUBE_LAST_CLIENTS):
+        for attempt in attempts:
+            label = attempt or 'default'
+            # المحاولة الأخيرة بلا كوكيز: البحث عن عميل يمنح الصيغ
+            # من عنوان الخادم دون حساب.
+            use_cookies = cookies_file if attempt is not bare_attempt else None
+            if attempt is bare_attempt:
+                label = "bare (بدون كوكيز)"
             options = _youtube_options(
                 destination_dir,
                 max_bytes,
-                cookies_file,
-                clients,
+                use_cookies,
+                attempt,
             )
             try:
                 with yt_dlp.YoutubeDL(options) as ydl:
@@ -532,13 +563,15 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
                 last_message = str(e)
                 print(
                     f"[YTDLP] yt-dlp {version} "
-                    f"{clients or 'default'} failed: "
+                    f"{label} failed: "
                     f"{_short_reason(e)}",
                     flush=True
                 )
-                # المحاولة الثانية والثالثة مخصّصة لحجب يوتيوب فقط؛
-                # غير ذلك نفشل فورًا.
-                if clients or not _looks_like_bot_check(last_message):
+                # المحاولات الإضافية مخصّصة لحجب يوتيوب فقط؛ غير ذلك فشل فوري.
+                if (
+                    attempt not in (None, bare_attempt)
+                    and not _looks_like_bot_check(last_message)
+                ):
                     raise _youtube_failure(last_message) from e
 
         if info is None:
