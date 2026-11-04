@@ -291,7 +291,10 @@ BOT_CHECK_HINTS = (
 )
 
 # عملاء بديلة يُجرَّبون معًا إن حجب يوتيوب العميل الافتراضي.
+# مع الكوكيز يستخدم yt-dlp غالبًا tv_downgraded + web_safari؛
+# المحاولة الثالثة جسر إضافي عند غياب بيئة JS.
 YOUTUBE_ALT_CLIENTS = ("tv", "web_safari", "android_vr")
+YOUTUBE_LAST_CLIENTS = ("tv_downgraded", "android_vr", "ios")
 
 
 def _short_reason(error):
@@ -317,6 +320,14 @@ def _youtube_failure(message):
         error = UrlDownloadError(
             "يوتيوب رفض الطلب من عنوان الخادم (فحص تحقق آلي). "
             "أضف كوكيز يوتيوب في إعدادات الخدمة ثم أعد المحاولة."
+        )
+    elif "larger than max-filesize" in lower:
+        error = UrlDownloadError("حجم الفيديو أكبر من الحد المسموح.")
+    elif "requested format is not available" in lower:
+        error = UrlDownloadError(
+            "يوتيوب لم يعطِ أي صيغة صوتية متاحة لهذا الخادم "
+            "(المشكلة في بيئة الخادم، وليست في الفيديو). "
+            "المطوّر سيصحح الإعداد قريبًا."
         )
     elif any(
         word in lower
@@ -455,6 +466,40 @@ def _yt_version():
         return "غير معروفة"
 
 
+def log_ytdlp_runtime():
+    """سجل بدء التشغيل: نسخة yt-dlp وتوفر بيئة JS (دنو)."""
+    import shutil
+
+    deno = shutil.which("deno")
+    node = shutil.which("node")
+    runtime = f"deno ({deno})" if deno else (
+        f"node ({node}، غير مفعّل افتراضيًا)" if node else "غير متوفر"
+    )
+    print(f"[YTDLP] yt-dlp {_yt_version()}؛ JS runtime: {runtime}", flush=True)
+
+
+def inspect_youtube(url, destination_dir, cookies_text=None):
+    """فحص للمطوّر: ما الصيغ التي يقدمها يوتيوب من هذا الخادم فعلًا؟"""
+    import yt_dlp
+
+    cookies_file, temporary_cookies = _youtube_cookies_file(
+        Path(destination_dir),
+        cookies_text
+    )
+    options = _youtube_options(
+        Path(destination_dir),
+        10_000_000_000,
+        cookies_file,
+    )
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            # process=False: قائمة الصيغ قبل تطبيق المحدد bestaudio/best.
+            return ydl.extract_info(url, download=False, process=False)
+    finally:
+        if temporary_cookies and cookies_file:
+            cookies_file.unlink(missing_ok=True)
+
+
 def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
     try:
         import yt_dlp
@@ -472,7 +517,7 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
     last_message = ""
 
     try:
-        for clients in (None, YOUTUBE_ALT_CLIENTS):
+        for clients in (None, YOUTUBE_ALT_CLIENTS, YOUTUBE_LAST_CLIENTS):
             options = _youtube_options(
                 destination_dir,
                 max_bytes,
@@ -491,7 +536,8 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
                     f"{_short_reason(e)}",
                     flush=True
                 )
-                # المحاولة الثانية مخصّصة لحجب يوتيوب فقط؛ غير ذلك نفشل فورًا.
+                # المحاولة الثانية والثالثة مخصّصة لحجب يوتيوب فقط؛
+                # غير ذلك نفشل فورًا.
                 if clients or not _looks_like_bot_check(last_message):
                     raise _youtube_failure(last_message) from e
 

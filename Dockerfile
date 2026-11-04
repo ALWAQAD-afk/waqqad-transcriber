@@ -1,14 +1,17 @@
 FROM python:3.12-slim-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg unzip ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg unzip curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # بيئة JS (Deno) يطلبها yt-dlp الحديث لتفريغ يوتيوب. تركيب «بأفضل جهد»:
-# إن فشل التنزيل يبقى البناء ناجحًا كما في النسخ السابقة.
-RUN python -c "import urllib.request, zipfile, io; data = urllib.request.urlopen('https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip', timeout=120).read(); zipfile.ZipFile(io.BytesIO(data)).extract('deno', '/usr/local/bin')" \
-    && (chmod +x /usr/local/bin/deno || true) \
-    || echo "WARN: deno install skipped (YouTube may need JS runtime later)"
+# المصدر الأول إصدار GitHub الأحدث؛ ثم سكربت deno.land الرسمي.
+# إن فشلا معًا يبقى البناء ناجحًا لكن يوتيوب قد تعطي صيغًا ناقصة.
+RUN (python -c "import urllib.request, zipfile, io; data = urllib.request.urlopen('https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip', timeout=120).read(); zipfile.ZipFile(io.BytesIO(data)).extract('deno', '/usr/local/bin')" \
+        && chmod +x /usr/local/bin/deno) \
+    || (curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y --no-modify-path) \
+    || echo "WARN: deno install failed — YouTube may return no-audio formats" \
+    && deno --version || echo "[WARN] deno NOT available at build end"
 
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --create-home app
