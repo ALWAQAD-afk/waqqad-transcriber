@@ -45,6 +45,7 @@ from werkzeug.utils import secure_filename
 # --- الاستقبال المباشر، التصدير، والطابور ---
 import job_queue
 import transcripts as transcript_store
+import url_media
 from bot_upload import (
     DownloadFailed,
     FileTooLarge,
@@ -144,6 +145,13 @@ TRANSCRIBER_LOG_CHAT_ID = os.environ.get(
     "TRANSCRIBER_LOG_CHAT_ID",
     ""
 ).strip()
+
+# حد تنزيل الروابط أكبر من حد تيليجرام، لأن الرابط لا يمر عبر البوت.
+# الافتراضي 150MB يكفي محاضرة طويلة بصيغة mp3 مضغوطة.
+TRANSCRIBER_URL_MAX_MB = float(
+    os.environ.get("TRANSCRIBER_URL_MAX_MB", "150") or 150
+)
+MAX_URL_BYTES = int(TRANSCRIBER_URL_MAX_MB * 1024 * 1024)
 
 # هوية المطوّر والمساهمين، تظهر في /about و/start.
 DEVELOPER_NAME = os.environ.get(
@@ -578,7 +586,8 @@ def new_job_payload(
     telegram_user_id,
     source="web",
     telegram_username="",
-    telegram_name=""
+    telegram_name="",
+    original_url=None
 ):
     """بنية موحّدة للمهمة، سواء جاءت من الويب أو من المحادثة."""
     return {
@@ -588,6 +597,7 @@ def new_job_payload(
         "error": None,
         "output_file": None,
         "original_filename": original_filename,
+        "original_url": original_url,
         "file_size_bytes": file_size,
         "started_at": time.time(),
         "completed_at": None,
@@ -2069,6 +2079,13 @@ def handle_transcriber_chat_update(update):
         _forward_contact(chat_id, user_id, sender, raw_text)
         return
 
+    # رابط يوتيوب أو رابط ملف مباشر يُفرّغ تلقائيًا.
+    if chat.get("type") == "private" and raw_text and not raw_text.startswith("/"):
+        found_url = url_media.extract_url(raw_text)
+        if found_url:
+            handle_bot_url(chat, sender, found_url)
+            return
+
     if not raw_text.startswith("/"):
         if chat.get("type") == "private" and (
             raw_text or message.get("photo") or message.get("sticker")
@@ -2076,6 +2093,7 @@ def handle_transcriber_chat_update(update):
             telegram_send_message(
                 chat_id,
                 "🎧 أرسل ملفاً صوتياً أو محاضرة، وسأفرّغها هنا مباشرة.\n"
+                "🔗 أو الصق رابط يوتيوب أو رابط ملف مباشر.\n"
                 "🔍 للبحث في تفريغاتك: /find\n"
                 "❓ لمعرفة الأوامر: /help"
             )
@@ -2110,13 +2128,15 @@ def handle_transcriber_chat_update(update):
             "وسأعيد لك التفريغ هنا.\n\n"
             "• حتى 20MB يُفرّغ مباشرة.\n"
             "• الأكبر من ذلك من صفحة الرفع.\n"
+            "• أو أرسل رابط يوتيوب أو رابط ملف مباشر.\n"
             "• /find للبحث في تفريغاتك السابقة.\n\n"
             f"👨‍💻 تطوير: {DEVELOPER_NAME} — /about للتفاصيل."
         )
     elif command == "/help":
         reply = (
             "🎙️ كيف تستخدم مفرّغ الوقّاد:\n"
-            "1) أرسل الملف الصوتي أو الفيديو في هذه المحادثة.\n"
+            "1) أرسل الملف الصوتي أو الفيديو في هذه المحادثة، "
+            "أو الصق رابط يوتيوب أو رابط ملف مباشر.\n"
             "2) انتظر، وستصلك النسخة الخام ثم المصححة والمحسّنة.\n"
             "3) نزّل DOCX أو TXT من الأزرار أسفل النتيجة.\n\n"
             "🔍 /find كلمة — البحث في تفريغاتك.\n"
@@ -2264,6 +2284,184 @@ def handle_bot_attachment(chat, sender, attachment):
             "في الطابور. أعد المحاولة."
         )
         log_transcription_failure(job_id)
+
+
+def create_url_job(url, user_id, sender, source):
+    """ينشئ مهمة من رابط قبل تنزيله، حتى تظهر حالتها فورًا."""
+    job_id = str(uuid.uuid4())
+    work_dir = (
+        Path("/tmp")
+        / f"waqqad_{job_id}"
+        / "original"
+    )
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    display_name = url_media.display_name_for_url(url)
+
+    create_job(
+        job_id,
+        new_job_payload(
+            job_id,
+            display_name,
+            0,
+            str(user_id),
+            source=source,
+            original_url=url,
+            **telegram_identity(sender)
+        )
+    )
+
+    return job_id, work_dir
+
+
+def _url_status(job_id, text, notify):
+    if not notify:
+        return
+    try:
+        update_status_message(job_id, text)
+    except Exception as e:
+        print(f"[URL STATUS] {job_id}: {e}", flush=True)
+
+
+def _fail_url_job(job_id, label, reason, notify, user_message):
+    update_job(
+        job_id,
+        status="failed",
+        stage="error",
+        error=str(reason)
+    )
+    log_transcription_failure(job_id)
+    _url_status(job_id, user_message, notify)
+
+
+def run_url_job(job_id, url, destination, notify=True):
+    """ينزّل الرابط ثم يمرّره إلى مسار التفريغ نفسه."""
+    job = get_job(job_id) or {}
+    label = job_label(job, url_media.display_name_for_url(url))
+
+    try:
+        update_job(job_id, status="processing", stage="downloading_url")
+        _url_status(
+            job_id,
+            f"⬇️ {label}\n"
+            "جارٍ تنزيل الرابط وتجهيز الصوت…\n"
+            "قد يستغرق التنزيل بضع دقائق حسب الرابط.",
+            notify
+        )
+
+        media_path, size, display_name = url_media.download_url(
+            url,
+            destination,
+            MAX_URL_BYTES
+        )
+
+        update_job(
+            job_id,
+            original_filename=display_name or label,
+            file_size_bytes=size,
+            stage="processing"
+        )
+
+        _url_status(
+            job_id,
+            f"🎧 {display_name or label}\n"
+            f"✅ تم التنزيل ({format_size(size)}).\n"
+            "⏳ جارٍ التفريغ الآن، وسيصلك النص عند اكتماله.",
+            notify
+        )
+
+        process_transcription_job(job_id, media_path)
+
+    except url_media.UrlTooLarge:
+        _fail_url_job(
+            job_id,
+            label,
+            "url file too large",
+            notify,
+            f"⚠️ {label}: الملف أكبر من الحد المسموح "
+            f"({int(TRANSCRIBER_URL_MAX_MB)}MB).\n"
+            "أرسل مقطعًا أقصر أو ارفع ملفًا مضغوطًا."
+        )
+    except url_media.UnsupportedUrl as e:
+        _fail_url_job(
+            job_id,
+            label,
+            f"unsupported url: {e}",
+            notify,
+            f"❌ {label}: {e}\n"
+            "أرسل رابط يوتيوب أو رابط ملف مباشر."
+        )
+    except url_media.UrlError as e:
+        _fail_url_job(
+            job_id,
+            label,
+            f"url download failed: {e}",
+            notify,
+            f"❌ {label}: تعذّر تنزيل الرابط.\n{e}"
+        )
+    except Exception as e:
+        print(
+            f"[URL JOB ERROR] {job_id}: {type(e).__name__}: {e}",
+            flush=True
+        )
+        _fail_url_job(
+            job_id,
+            label,
+            str(e),
+            notify,
+            f"❌ {label}: حدث خطأ غير متوقع أثناء معالجة الرابط.\n"
+            "أعد المحاولة، وإن تكرر فأبلغنا عبر /contact."
+        )
+
+
+def handle_bot_url(chat, sender, url):
+    """رابط وصل إلى محادثة البوت: مهمة تنزيل ثم تفريغ."""
+    chat_id = chat.get("id")
+    user_id = sender.get("id")
+
+    if chat.get("type") != "private":
+        telegram_send_message(
+            chat_id,
+            "أرسل الرابط في محادثة خاصة معي، حتى تبقى النتيجة لك وحدك."
+        )
+        return
+
+    job_id, destination = create_url_job(
+        url,
+        user_id,
+        sender,
+        source="bot_url"
+    )
+
+    display_name = url_media.display_name_for_url(url)
+    send_status_message(
+        job_id,
+        chat_id,
+        f"🔗 وصلني الرابط: {display_name}\n"
+        f"📦 الحد الأقصى: {int(TRANSCRIBER_URL_MAX_MB)}MB\n\n"
+        "سأنزّله وأفرّغه، وستصل النتيجة هنا.\n"
+        "يمكنك إغلاق المحادثة."
+    )
+
+    try:
+        job_queue.enqueue(
+            job_id,
+            run_url_job,
+            job_id,
+            url,
+            destination,
+            True
+        )
+    except Exception as e:
+        print(f"[QUEUE ERROR] url job {job_id}: {e}", flush=True)
+        _fail_url_job(
+            job_id,
+            display_name,
+            f"enqueue failed: {e}",
+            True,
+            f"❌ {display_name}: تعذّر إدخال الرابط في الطابور. "
+            "أعد المحاولة."
+        )
 
 
 def run_bot_job(job_id, attachment, destination):
@@ -3019,6 +3217,49 @@ def transcribe():
         "status": "queued",
         "message":
             "Transcription job started."
+    }), 202
+
+
+@app.route(
+    "/transcribe-url",
+    methods=["POST"]
+)
+def transcribe_url():
+    """مهمة من رابط يوتيوب أو ملف مباشر، من صفحة الرفع."""
+    try:
+        tg_user = _current_telegram_user()
+    except ValueError as auth_error:
+        return _unauthorized(auth_error)
+
+    payload = request.get_json(silent=True) or request.form or {}
+    url = str(payload.get("url") or "").strip()
+
+    if not url_media.is_url(url):
+        return jsonify({
+            "error": "أرسل رابطًا صالحًا يبدأ بـ http أو https."
+        }), 400
+
+    telegram_user_id = str(tg_user["id"])
+    job_id, destination = create_url_job(
+        url,
+        telegram_user_id,
+        tg_user,
+        source="web_url"
+    )
+
+    job_queue.enqueue(
+        job_id,
+        run_url_job,
+        job_id,
+        url,
+        destination,
+        False
+    )
+
+    return jsonify({
+        "job_id": job_id,
+        "status": "queued",
+        "message": "URL transcription job started."
     }), 202
 
 
