@@ -11,6 +11,7 @@
 - يوتيوب فقط يُمرَّر إلى yt-dlp؛ بقية الروابط تُحمَّل مباشرة عبر HTTP.
 """
 
+import base64
 import ipaddress
 import mimetypes
 import os
@@ -274,14 +275,93 @@ def _download_direct(url, destination_dir, max_bytes):
         response.close()
 
 
-def _download_youtube(url, destination_dir, max_bytes):
+# عبارات تظهر في خطأ يوتيوب عندما يطلب التحقق من أن الطلب ليس آليًا.
+BOT_CHECK_HINTS = (
+    "sign in to confirm",
+    "not a bot",
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+    "use --cookies",
+    "cookies-from-browser",
+    "login required",
+)
+
+# عميل بديل يُجرَّب مرة واحدة إن حجب يوتيوب العميل الافتراضي.
+YOUTUBE_ALT_CLIENTS = ("tv", "android_vr")
+
+
+def _short_reason(error):
+    """سطر قصير من خطأ yt-dlp يصلح للسجلّات."""
+    message = " ".join(str(error or "").split())
+    if message.startswith("ERROR: "):
+        message = message[7:]
+    return message[:280]
+
+
+def _looks_like_bot_check(message):
+    lower = (message or "").lower()
+    return any(hint in lower for hint in BOT_CHECK_HINTS)
+
+
+def _youtube_failure(message):
+    """رسالة عربية للمستخدم، مع التفاصيل الحقيقية في ``detail`` للسجل."""
+    if "larger than max-filesize" in (message or "").lower():
+        return UrlTooLarge("حجم الفيديو أكبر من الحد المسموح.")
+
+    lower = (message or "").lower()
+    if _looks_like_bot_check(message):
+        error = UrlDownloadError(
+            "يوتيوب رفض الطلب من عنوان الخادم (فحص تحقق آلي). "
+            "أضف كوكيز يوتيوب في إعدادات الخدمة ثم أعد المحاولة."
+        )
+    elif any(
+        word in lower
+        for word in ("private", "unavailable", "removed", "blocked")
+    ):
+        error = UrlDownloadError(
+            "الفيديو غير متاح: قد يكون خاصًا أو محذوفًا "
+            "أو محجوبًا في منطقة الخادم."
+        )
+    else:
+        error = UrlDownloadError(
+            "تعذّر تنزيل رابط يوتيوب. قد يكون الفيديو خاصًا أو محجوبًا."
+        )
+
+    error.detail = _short_reason(message)
+    return error
+
+
+def _youtube_cookies_file(destination_dir):
+    """يعيد (مسار الكوكيز، هل هو مؤقت؟).
+
+    يدعم ملفًا على الخادم، أو نص base64 في متغيّر بيئة (أنسب لـ Render).
+    """
+    existing = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+    if existing and Path(existing).is_file():
+        return Path(existing), False
+
+    encoded = os.environ.get("YTDLP_COOKIES_B64", "").strip()
+    if not encoded:
+        return None, False
+
     try:
-        import yt_dlp
-    except ImportError as e:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception as e:
         raise UrlDownloadError(
-            "دعم يوتيوب غير مثبّت على الخادم."
+            "إعداد كوكيز يوتيوب غير صالح (YTDLP_COOKIES_B64). "
+            "تأكد من نسخ الملف كاملًا بصيغة base64."
         ) from e
 
+    if not raw.strip():
+        raise UrlDownloadError("ملف كوكيز يوتيوب فارغ.")
+
+    path = destination_dir / ".youtube-cookies.txt"
+    path.write_bytes(raw)
+    path.chmod(0o600)
+    return path, True
+
+
+def _youtube_options(destination_dir, max_bytes, cookies_file=None, clients=None):
     options = {
         "format": "bestaudio/best",
         "noplaylist": True,
@@ -301,20 +381,55 @@ def _download_youtube(url, destination_dir, max_bytes):
         "postprocessor_args": ["-threads", "1"],
     }
 
-    cookies_file = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-    if cookies_file and Path(cookies_file).exists():
-        options["cookiefile"] = cookies_file
+    if cookies_file:
+        options["cookiefile"] = str(cookies_file)
+    if clients:
+        options["extractor_args"] = {
+            "youtube": {"player_client": list(clients)}
+        }
+    return options
+
+
+def _download_youtube(url, destination_dir, max_bytes):
+    try:
+        import yt_dlp
+    except ImportError as e:
+        raise UrlDownloadError(
+            "دعم يوتيوب غير مثبّت على الخادم."
+        ) from e
+
+    cookies_file, temporary_cookies = _youtube_cookies_file(destination_dir)
+    info = None
+    last_message = ""
 
     try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except Exception as e:
-        message = str(e)
-        if "larger than max-filesize" in message.lower():
-            raise UrlTooLarge("حجم الفيديو أكبر من الحد المسموح.") from e
-        raise UrlDownloadError(
-            "تعذّر تنزيل رابط يوتيوب. قد يكون الفيديو خاصًا أو محجوبًا."
-        ) from e
+        for clients in (None, YOUTUBE_ALT_CLIENTS):
+            options = _youtube_options(
+                destination_dir,
+                max_bytes,
+                cookies_file,
+                clients,
+            )
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                break
+            except Exception as e:
+                last_message = str(e)
+                print(
+                    f"[YTDLP] {clients or 'default'} failed: "
+                    f"{_short_reason(e)}",
+                    flush=True
+                )
+                # المحاولة الثانية مخصّصة لحجب يوتيوب فقط؛ غير ذلك نفشل فورًا.
+                if clients or not _looks_like_bot_check(last_message):
+                    raise _youtube_failure(last_message) from e
+
+        if info is None:
+            raise _youtube_failure(last_message or "unknown youtube error")
+    finally:
+        if temporary_cookies and cookies_file:
+            cookies_file.unlink(missing_ok=True)
 
     title = str((info or {}).get("title") or "").strip()
     files = [
