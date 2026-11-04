@@ -2814,6 +2814,7 @@ def handle_ytinfo_command(chat_id, user_id, argument):
 
     work_dir = Path("/tmp") / f"waqqad_ytinfo_{uuid.uuid4().hex}"
     work_dir.mkdir(parents=True, exist_ok=True)
+    runtime = url_media.js_runtime_state()
     try:
         try:
             cookies_text = get_setting(YOUTUBE_COOKIES_KEY)
@@ -2839,6 +2840,7 @@ def handle_ytinfo_command(chat_id, user_id, argument):
             f"ℹ️ {title}",
             f"🧾 نسخة yt-dlp: {url_media._yt_version()}"
             f" — الكوكيز: {cookies_state}",
+            f"🖥️ بيئة JavaScript: {runtime}",
             f"📀 الصيغ: {len(formats)}"
             f" — تصلح للصوت فقط: {len(audible)}"
             f" — مدمجة (صوت+صورة): {len(merged)}",
@@ -2862,7 +2864,8 @@ def handle_ytinfo_command(chat_id, user_id, argument):
         print(f"[YTINFO] inspect failed: {e}", flush=True)
         telegram_send_message(
             chat_id,
-            f"⚠️ فشل الفحص: {url_media._short_reason(e)}"
+            f"⚠️ فشل الفحص: {url_media._short_reason(e)}\n"
+            f"🖥️ بيئة JS: {runtime}"
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
