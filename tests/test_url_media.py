@@ -264,6 +264,14 @@ class TestYoutubeCookies(unittest.TestCase):
                 ["tv", "android_vr"]
             )
 
+    def test_player_response_failure_counts_as_block(self):
+        """هذا الخطأ كان يتجاوز المحاولة البديلة سابقًا."""
+        self.assertTrue(
+            url_media._looks_like_bot_check(
+                "[youtube] abc123: Failed to extract any player response;"
+            )
+        )
+
 
 class TestDisplayName(unittest.TestCase):
     def test_youtube_name(self):
