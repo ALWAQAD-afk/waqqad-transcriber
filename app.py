@@ -181,6 +181,593 @@ def is_developer(user_id):
     return bool(DEVELOPER_CHAT_ID) and str(user_id) == str(DEVELOPER_CHAT_ID)
 
 
+# الحجب: جدول مستقل في القاعدة حتى يبقى ساريًا بعد إعادة التشغيل.
+_BLOCKED_THROTTLE = {}
+
+BLOCKED_GATE_TEXT = (
+    "⚠️ تم إيقاف استخدام هذه الخدمة لحسابك من قبل المطوّر."
+)
+
+FEEDBACK_VERDICTS = {
+    "good": "👍 ممتاز",
+    "ok": "👌 جيد",
+    "bad": "👎 يحتاج تحسين",
+}
+
+DEVELOPER_ONLY_COMMANDS = [
+    {"command": "stats", "description": "إحصاءات الخدمة"},
+    {"command": "users", "description": "آخر 20 مستخدمًا"},
+    {"command": "allusers", "description": "كل المستخدمين من التأسيس"},
+    {"command": "cookies", "description": "حالة كوكيز يوتيوب"},
+    {"command": "block", "description": "إيقاف مستخدم: /block معرفه"},
+    {"command": "unblock", "description": "إلغاء إيقاف مستخدم"},
+    {"command": "blocked", "description": "قائمة المحجوبين"},
+    {"command": "msg", "description": "مراسلة مستخدم: /msg الرقم"},
+]
+
+PUBLIC_COMMANDS = [
+    {"command": "start", "description": "ابدأ استخدام المفرّغ"},
+    {"command": "help", "description": "كيفية الاستخدام"},
+    {"command": "find", "description": "البحث في تفريغاتك"},
+    {"command": "about", "description": "عن المطوّر والمساهمين"},
+    {"command": "contact", "description": "مراسلة المطوّر"},
+    {"command": "cancel", "description": "إلغاء وضع الكتابة"},
+]
+
+
+def register_bot_commands():
+    """تسجيل الأوامر حتى تظهر أوتوبوسلوك بعد علامة /.
+
+    Telegram لا يعرض قائمة تلقائية من الكود إلا عبر setMyCommands.
+    نغيّر قائمة عامة للجميع، وقائمة خاصة بالمطوّر في محادثته فقط.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+    def _call(label, payload):
+        try:
+            response = requests.post(
+                f"{api}/setMyCommands",
+                json=payload,
+                timeout=20
+            ).json()
+            okay = response.get("ok")
+            detail = "ok" if okay else str(response.get("description"))[:150]
+            print(f"[MENU] {label}: {detail}", flush=True)
+        except Exception as e:
+            print(f"[MENU] {label} failed: {e}", flush=True)
+
+    _call("المستخدمين", {"commands": PUBLIC_COMMANDS})
+
+    if DEVELOPER_CHAT_ID:
+        _call(
+            "المطوّر",
+            {
+                "commands": PUBLIC_COMMANDS + DEVELOPER_ONLY_COMMANDS,
+                "scope": {
+                    "type": "chat",
+                    "chat_id": int(DEVELOPER_CHAT_ID),
+                },
+            }
+        )
+
+
+def is_blocked(user_id):
+    """هل الحساب موقوف؟ القاعدة مرجع السلطة."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM blocked_users WHERE user_id = %s",
+                    (str(user_id),)
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        print(f"[BLOCK] check failed: {e}", flush=True)
+        return False
+
+
+def _blocked_gate_now(user_id):
+    """قفل الرسالة الإيقاعية: مرة كل 30 دقيقة بدل إزعاج متكرر.
+
+    يعيد True إذا كان مسموحًا إرسال الإشعار الآن.
+    """
+    key = str(user_id)
+    now = time.time()
+    with _CONTACT_LOCK:
+        last = _BLOCKED_THROTTLE.get(key, 0)
+        if now - last < 1800:
+            return False
+        _BLOCKED_THROTTLE[key] = now
+        if len(_BLOCKED_THROTTLE) > 2000:
+            for old_key in list(_BLOCKED_THROTTLE)[:500]:
+                _BLOCKED_THROTTLE.pop(old_key, None)
+    return True
+
+
+def handle_blocked_gate(user_id):
+    """إشعار متقطّع للمحجوب بدل تجاهل صامت كامل."""
+    if not _blocked_gate_now(user_id):
+        return
+    try:
+        telegram_send_message(user_id, BLOCKED_GATE_TEXT)
+    except Exception as e:
+        print(f"[BLOCK] gate notify failed: {e}", flush=True)
+
+
+def handle_block_command(chat_id, user_id, argument):
+    if not is_developer(user_id):
+        telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
+        return
+
+    target = (argument or "").strip().lstrip("@")
+    if not target:
+        telegram_send_message(
+            chat_id,
+            "استخدم: /block <رقم المستخدم>\n"
+            "مثال: /block 123456789\n\n"
+            "/blocked لعرض المحجوبين."
+        )
+        return
+
+    if str(target) == str(DEVELOPER_CHAT_ID):
+        telegram_send_message(chat_id, "لا يمكنك حجب نفسك 🙂")
+        return
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO blocked_users (user_id)
+                    VALUES (%s)
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (str(target),)
+                )
+                conn.commit()
+    except Exception as e:
+        print(f"[BLOCK] save failed: {e}", flush=True)
+        telegram_send_message(chat_id, "⚠️ تعذّر الحفظ. حاول من جديد.")
+        return
+
+    info = telegram_get_chat(target)
+    name = " ".join(
+        part for part in (
+            str(info.get("first_name") or ""),
+            str(info.get("last_name") or "")
+        ) if part
+    ).strip()
+    username = str(info.get("username") or "").strip().lstrip("@")
+    who = (
+        f"@{username} ({name})" if username and name
+        else f"@{username}" if username
+        else name or "بلا اسم"
+    )
+
+    telegram_send_message(chat_id, f"🔒 تم إيقاف استخدام: {who}\n🆔 {target}")
+
+
+def handle_unblock_command(chat_id, user_id, argument):
+    if not is_developer(user_id):
+        telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
+        return
+
+    target = (argument or "").strip().lstrip("@")
+    if not target:
+        telegram_send_message(chat_id, "استخدم: /unblock <رقم المستخدم>")
+        return
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM blocked_users WHERE user_id = %s",
+                    (str(target),)
+                )
+                removed = cur.rowcount
+                conn.commit()
+    except Exception as e:
+        print(f"[BLOCK] unblock failed: {e}", flush=True)
+        telegram_send_message(chat_id, "⚠️ تعذّر الإلغاء. حاول من جديد.")
+        return
+
+    if removed:
+        telegram_send_message(chat_id, f"✅ أعيد فتح استخدام: {target}")
+    else:
+        telegram_send_message(chat_id, f"ℹ️ هذا الرقم غير محجوب أصلًا: {target}")
+
+
+def handle_blocked_list(chat_id, user_id):
+    if not is_developer(user_id):
+        telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
+        return
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT b.user_id, b.created_at
+                    FROM blocked_users b
+                    ORDER BY b.created_at DESC
+                """)
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[BLOCK] list failed: {e}", flush=True)
+        telegram_send_message(chat_id, "⚠️ تعذّر قراءة القائمة.")
+        return
+
+    if not rows:
+        telegram_send_message(chat_id, "لا يوجد مستخدمون محجوبون.")
+        return
+
+    lines = [f"🚫 المحجوبون ({len(rows)}):"]
+    for row in rows:
+        seen = row.get("created_at")
+        when = seen.strftime("%Y-%m-%d") if seen else "غير متاح"
+        lines.append(f"• {row.get('user_id')} — منذ {when}")
+    telegram_send_message(chat_id, "\n".join(lines))
+
+
+def _display_target(target):
+    """بطاقة قصيرة للعميل عند المراسلة: الاسم/الحساب/الرسالة."""
+    info = telegram_get_chat(target)
+    name = " ".join(
+        part for part in (
+            str(info.get("first_name") or ""),
+            str(info.get("last_name") or "")
+        ) if part
+    ).strip()
+    username = str(info.get("username") or "").strip().lstrip("@")
+    if username:
+        return (
+            f"@{username} ({name})" if name else f"@{username}"
+        )
+    return name or "بلا اسم مستخدم"
+
+
+def send_developer_message(target, text):
+    """يوصّل رسالة المطوّر إلى عميل بوت دون طلب مسبق.
+
+    يعيد رقم رسالة البوت لتوجيه ندرة على respondsها؛ أو None عند فشل الإرسال.
+    """
+    body = (
+        "💬 رسالة من مطوّر مفرّغ الوقّاد:\n\n"
+        f"{(text or '').strip()[:MSG_MAX_CHARS]}\n\n"
+        "↩️ للردّ، اضغط زر «ردّ» على هذه الرسالة وسيردّ إليك المطوّر."
+    )
+    try:
+        message_id = telegram_send_message(target, body)
+    except Exception as e:
+        print(f"[OUTREACH] send failed: {e}", flush=True)
+        return None
+    if message_id:
+        with _OUTREACH_LOCK:
+            _OUTREACH_REPLIES[str(message_id)] = str(target)
+            if len(_OUTREACH_REPLIES) > 500:
+                for old_key in list(_OUTREACH_REPLIES)[:100]:
+                    _OUTREACH_REPLIES.pop(old_key, None)
+    return message_id
+
+
+def handle_msg_command(chat_id, user_id, argument):
+    """أمر المطوّر /msg <id> <نص> آو /msg <id> ثم نص بعد تحفيز."""
+    if not is_developer(user_id):
+        telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
+        return
+
+    if not argument:
+        telegram_send_message(
+            chat_id,
+            "استخدم: /msg <رقم المستخدم> <الرسالة>\n"
+            "مثال: /msg 123456789 مرحبًا، كيف الخدمة؟\n\n"
+            "الأرقام تظهر في /users و/allusers."
+        )
+        return
+
+    head, _, text = (argument or "").partition(" ")
+    text = text.strip()
+    try:
+        target = int(head.strip())
+    except ValueError:
+        telegram_send_message(
+            chat_id,
+            "الرجاء رقم مستخدم صحيح. مثال: /msg 123456789 مرحبًا"
+        )
+        return
+
+    if not text:
+        # وضع انتظار: نص المطوّر التالي يمرّر لهذا المستخدم مباشرة.
+        with _OUTREACH_LOCK:
+            _PENDING_TO[str(user_id)] = {
+                "mode": _MESSAGES_MODE,
+                "user_id": str(target),
+                "started": time.time(),
+            }
+        who = _display_target(target)
+        telegram_send_message(
+            chat_id,
+            f"سأرسل رسالتك التالية إلى: {who}\n🆔 {target}\n\n"
+            "اكتب الرسالة الآن في الرسالة التالية، أو /cancel للإلغاء."
+        )
+        return
+
+    if send_developer_message(target, text) is None:
+        telegram_send_message(
+            chat_id,
+            "⚠️ تعذّر إرسال الرسالة. ربما حظر المستخدم البوت."
+        )
+        return
+    telegram_send_message(
+        chat_id,
+        f"✅ أُرسلت الرسالة إلى: {target}"
+    )
+
+
+def _consume_pending_outreach(user_id):
+    """هل قيد إرسال رسالة من المطوّر لعائلة مستخدم الآن؟"""
+    key = str(user_id)
+    with _OUTREACH_LOCK:
+        entry = _PENDING_TO.get(key)
+        if entry is None:
+            return None
+        _PENDING_TO.pop(key, None)
+
+    if time.time() - entry.get("started", 0) > CONTACT_WINDOW_SECONDS:
+        telegram_send_message(
+            user_id,
+            "انتهت مهلة الرسالة أعد /msg من جديد."
+        )
+        return None
+    return entry
+
+
+def _clear_pending_outreach(user_id):
+    with _OUTREACH_LOCK:
+        _PENDING_TO.pop(str(user_id), None)
+
+
+def forward_outreach_reply(chat_id, user_id, sender, message):
+    """ردّ المستخدم على رسالة صادرة يصل للمطوّر تلقائيًا.
+
+    يعيد True إذا استُهلك هذا التحديث، بحيث لا يعالج كرفع ملف أو غيره.
+    """
+    replied_id = ((message.get("reply_to_message") or {}).get("message_id"))
+    if not replied_id:
+        return False
+
+    with _OUTREACH_LOCK:
+        owner = _OUTREACH_REPLIES.get(str(replied_id))
+    if not owner or str(owner) != str(user_id):
+        return False
+
+    text = (message.get("text") or message.get("caption") or "").strip()
+    if not text:
+        telegram_send_message(
+            chat_id,
+            "اكتب ردّك نصاً وسيصل للمطوّر مباشرة."
+        )
+        return True
+
+    if not _forward_contact(chat_id, user_id, sender, text):
+        return True
+
+    # رسالة التواصل تصل للمطوّر؛ نعلن للقارئ أنها ردّ على مراسلة استباقية.
+    return True
+
+
+def handle_allusers(chat_id, user_id):
+    """كل مستخدم استخدم البوت من التأسيس، للمطوّر فقط."""
+    if not is_developer(user_id):
+        telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
+        return
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        data->>'telegram_user_id' AS user_id,
+                        MIN(created_at) AS first_seen,
+                        MAX(created_at) AS last_seen,
+                        COUNT(*) AS jobs,
+                        COALESCE(
+                            MAX(NULLIF(data->>'telegram_username', '')),
+                            ''
+                        ) AS username,
+                        COALESCE(
+                            MAX(NULLIF(data->>'telegram_name', '')),
+                            ''
+                        ) AS name,
+                        (b.user_id IS NOT NULL) AS blocked
+                    FROM jobs j
+                    LEFT JOIN blocked_users b
+                        ON b.user_id = data->>'telegram_user_id'
+                    WHERE data->>'telegram_user_id' IS NOT NULL
+                      AND data->>'telegram_user_id' <> ''
+                    GROUP BY 1, b.user_id
+                    ORDER BY MIN(created_at) ASC
+                """)
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[ALLUSERS] query failed: {e}", flush=True)
+        telegram_send_message(chat_id, "⚠️ تعذّر قراءة المستخدمين.")
+        return
+
+    if not rows:
+        telegram_send_message(
+            chat_id,
+            "لا يوجد مستخدمون مسجّلون منذ تأسيس البوت."
+        )
+        return
+
+    blocked_total = sum(1 for row in rows if row.get("blocked"))
+    lines = [
+        f"👥 كل المستخدمين منذ التأسيس: {len(rows)}"
+        + (f" (منهم محجوب: {blocked_total})" if blocked_total else "")
+    ]
+
+    for index, row in enumerate(rows, start=1):
+        tg_id = row.get("user_id") or "غير معروف"
+        username = str(row.get("username") or "").strip().lstrip("@")
+        name = str(row.get("name") or "").strip()
+
+        if not username:
+            info = telegram_get_chat(tg_id)
+            if info:
+                username = str(
+                    info.get("username") or ""
+                ).strip().lstrip("@")
+                fetched_name = " ".join(
+                    part for part in (
+                        str(info.get("first_name") or "").strip(),
+                        str(info.get("last_name") or "").strip(),
+                    ) if part
+                )
+                name = name or fetched_name
+                _save_user_identity(tg_id, username, name)
+
+        if username:
+            who = f"@{username}"
+            if name:
+                who += f" ({name})"
+        elif name:
+            who = f"{name} (بلا اسم مستخدم)"
+        else:
+            who = "بلا اسم مستخدم"
+
+        first_seen = row.get("first_seen")
+        started = first_seen.strftime("%Y-%m-%d") if first_seen else "?"
+        blocked = "🔒 " if row.get("blocked") else ""
+        lines.append(
+            f"{index}. {blocked}{who}\n"
+            f"   🆔 {tg_id} — أول استخدام: {started}"
+            f" — المهام: {row.get('jobs') or 0}"
+        )
+
+    # رسالة واحدة لا تتعدى 4096 محرف؛ نقسّم الأسماء على رسائل متتابعة.
+    chunk = _USERS_CHUNK
+    blocks = [lines[i:i + chunk] for i in range(0, len(lines), chunk)]
+    for position, block in enumerate(blocks, start=1):
+        if position > 1:
+            block = [f"👤 طبقة {position} من {len(blocks)}"] + block
+        try:
+            telegram_send_message(chat_id, "\n".join(block))
+        except Exception as e:
+            print(f"[ALLUSERS] send chunk {position} failed: {e}", flush=True)
+            break
+
+
+def save_feedback(job_id, verdict):
+    """تقييم واحد لكل مهمة."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO feedback (job_id, verdict) VALUES (%s, %s)",
+                (str(job_id), verdict)
+            )
+            conn.commit()
+
+
+def has_feedback(job_id):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM feedback WHERE job_id = %s",
+                    (str(job_id),)
+                )
+                return cur.fetchone() is not None
+    except Exception:
+        # عند فشل القاعدة نمنع الإزعاج بدل تكرار الطلب.
+        return True
+
+
+def send_feedback_prompt(job_id, user_id):
+    """تقييم يصل للمطوّر مباشرة، اختياري ولا يوقظ إزعاجًا للعميل."""
+    user_id = int(user_id) if isinstance(user_id, str) else user_id
+    if is_developer(user_id):
+        return
+
+    try:
+        if has_feedback(job_id):
+            return
+    except Exception:
+        return
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "👍 ممتاز", "callback_data": f"fb:{job_id}:good"},
+                {"text": "👌 جيد", "callback_data": f"fb:{job_id}:ok"},
+                {"text": "👎 يحتاج تحسين", "callback_data": f"fb:{job_id}:bad"},
+            ],
+            [{"text": "💬 أرسل ملاحظة", "callback_data": f"fb:{job_id}:note"}],
+        ]
+    }
+    try:
+        telegram_send_message(
+            user_id,
+            "ساعد المطوّر في تطوير الخدمة: كيف كانت جودة التفريغ؟\n"
+            "اختيارك يصل له مباشرة، وتقدر أيضًا ترسل ملاحظة نصية.",
+            keyboard
+        )
+    except Exception as e:
+        print(f"[FEEDBACK] prompt failed job={job_id}: {e}", flush=True)
+
+
+def answer_feedback_callback(callback_id, choice, job_id, callback):
+    """معالجة زر التقييم أو ملاحظة المستخدم."""
+    sender = callback.get("from") or {}
+    user_id = sender.get("id")
+    job = get_job(job_id) or {}
+    owner = job.get("telegram_user_id")
+
+    if not job or (owner and str(owner) != str(user_id)):
+        answer_callback(callback_id, "هذا التقييم غير متاح لك", alert=True)
+        return
+
+    if choice == "note":
+        with _CONTACT_LOCK:
+            _CONTACT_PENDING[str(user_id)] = time.time()
+        answer_callback(callback_id, "اكتب ملاحظتك في الرسالة التالية")
+        telegram_send_message(user_id, CONTACT_INTRO)
+        return
+
+    if choice not in FEEDBACK_VERDICTS:
+        answer_callback(callback_id, "خيار غير معروف", alert=True)
+        return
+
+    if has_feedback(job_id):
+        answer_callback(callback_id, "سُجّل تقييمك سابقًا، شكرًا 🙏")
+        return
+
+    try:
+        save_feedback(job_id, choice)
+    except Exception as e:
+        print(f"[FEEDBACK] save failed job={job_id}: {e}", flush=True)
+        answer_callback(callback_id, "تعذّر حفظ التقييم الآن", alert=True)
+        return
+
+    answer_callback(callback_id, "شكرًا على تقييمك 🙏")
+
+    sender_name = _display_name(sender)
+    username = (sender.get("username") or "").strip()
+    handle = f"@{username}" if username else "بلا اسم مستخدم"
+    body = (
+        "📊 تغذية راجعة جديدة\n"
+        f"النتيجة: {FEEDBACK_VERDICTS[choice]}\n"
+        f"الملف: {job_label(job, 'تفريغ')}\n"
+        f"👤 {sender_name} ({handle}) — ID: {user_id}"
+    )
+    try:
+        telegram_send_message(DEVELOPER_CHAT_ID, body)
+    except Exception as e:
+        print(f"[FEEDBACK] notify failed: {e}", flush=True)
+
+
 # التواصل يمرّ عبر البوت حتى لا تُنشر بيانات المطوّر الشخصية.
 # الانتظار في الذاكرة يكفي لأن الخدمة تعمل بعامل واحد (workers=1).
 _CONTACT_PENDING = {}
@@ -188,6 +775,19 @@ _CONTACT_REPLIES = {}
 _CONTACT_LOCK = threading.Lock()
 CONTACT_WINDOW_SECONDS = 30 * 60
 CONTACT_MAX_CHARS = 3000
+
+# مراسلة المطوّر للمستخدمين دون أن يراسلوه أولًا.
+# _PENDING_TO: وضع «سأرسل رسالتي التالية إلى عميل X».
+# _OUTREACH_REPLIES: رسالة البوت الصادرة → صاحبها، توجّه ردود المستخدم.
+_OUTREACH_LOCK = threading.Lock()
+_PENDING_TO = {}
+_OUTREACH_REPLIES = {}
+_MESSAGES_MODE = "outreach"
+
+MSG_MAX_CHARS = 3000
+
+_ITEM_COUNT = threading.Lock()  # لا يُستخدم؛ نُبقي الاسم قصيرًا للسجل فقط.
+_USERS_CHUNK = 18  # عدد الأسماء في كل رسالة أسماء بعيدة.
 
 
 def contributors_text():
@@ -402,7 +1002,7 @@ def _safe_upload_name(original_name):
 
 
 def init_db():
-    """إنشاء جدول المهام والإعدادات إن لم تكن موجودة."""
+    """إنشاء جدول المهام والإعدادات والحظر والتغذية الراجعة."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -420,8 +1020,21 @@ def init_db():
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS blocked_users (
+                    user_id TEXT PRIMARY KEY,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS feedback (
+                    job_id TEXT PRIMARY KEY,
+                    verdict TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
             conn.commit()
-    print("[DB] Jobs and settings tables ready", flush=True)
+    print("[DB] Jobs, settings, blocked and feedback tables ready", flush=True)
 
 
 YOUTUBE_COOKIES_KEY = "youtube_cookies"
@@ -541,6 +1154,12 @@ def _webhook_check_startup():
         ensure_webhook_updates()
     except Exception as e:
         print(f"[WEBHOOK CHECK] Warning: {e}", flush=True)
+
+    # قائمة الأوامر بعد علامة /: تسجيل غير متكرّر ولشاشة قليلة التكلفة.
+    try:
+        register_bot_commands()
+    except Exception as e:
+        print(f"[MENU] Warning: {e}", flush=True)
 
 
 threading.Thread(
@@ -1965,6 +2584,12 @@ def handle_users(chat_id, user_id):
         )
 
     telegram_send_message(chat_id, "\n".join(lines))
+    if len(rows) >= 20:
+        telegram_send_message(
+            chat_id,
+            "لعرض كل المستخدمين منذ التأسيس: /allusers\n"
+            "خيارات إضافية: /block و/unblock و/blocked و/msg"
+        )
 
 
 def handle_stats(chat_id, user_id):
@@ -2226,10 +2851,29 @@ def handle_transcriber_chat_update(update):
 
     user_id = sender.get("id")
 
+    # البوابة الحاجزة: المحجوب لا يستخدم أي شيء داخل البوت.
+    if (
+        user_id
+        and chat.get("type") == "private"
+        and not is_developer(user_id)
+        and is_blocked(user_id)
+    ):
+        handle_blocked_gate(user_id)
+        return
+
     # ردّ المطوّر على رسالة تواصل يعود لصاحب الرسالة.
     if is_developer(user_id) and message.get("reply_to_message"):
         if handle_developer_reply(message, chat_id):
             return
+
+    # ردّ المستخدم على رسالة بدأها المطوّر يُوجَّه للمطوّر تلقائيًا.
+    if (
+        not is_developer(user_id)
+        and chat.get("type") == "private"
+        and message.get("reply_to_message")
+        and forward_outreach_reply(chat_id, user_id, sender, message)
+    ):
+        return
 
     # ملف cookies.txt من المطوّر يُحفظ لتفريغ روابط يوتيوب.
     if is_developer(user_id) and _is_cookies_document(message):
@@ -2242,6 +2886,20 @@ def handle_transcriber_chat_update(update):
         return
 
     raw_text = (message.get("text") or "").strip()
+
+    # رسالة المطوّر أثناء وضع /msg تمرّر إلى المستخدم المقصود.
+    if is_developer(user_id) and raw_text and not raw_text.startswith("/"):
+        entry = _consume_pending_outreach(user_id)
+        if entry:
+            target = entry.get("user_id")
+            if send_developer_message(target, raw_text):
+                telegram_send_message(chat_id, f"✅ أُرسلت رسالتك إلى: {target}")
+            else:
+                telegram_send_message(
+                    chat_id,
+                    "⚠️ تعذّر إرسال الرسالة. ربما حظر المستخدم البوت."
+                )
+            return
 
     # رسالة عادية بعد /contact تُمرَّر إلى المطوّر بدل ردّ البوت المعتاد.
     if (
@@ -2284,10 +2942,11 @@ def handle_transcriber_chat_update(update):
     command = command.split("@", 1)[0].lower()
     argument = argument.strip()
 
-    # أي أمر آخر ينهي وضع كتابة رسالة التواصل، فلا تُمرَّر رسالة لاحقة بالخطأ.
-    if command != "/contact":
+    # أي أمر آخر ينهي وضع كتابة رسالة تواصل أو رسالة مُوجَّهة للمطوّر.
+    if command not in ("/contact", "/msg"):
         with _CONTACT_LOCK:
             _CONTACT_PENDING.pop(str(user_id), None)
+        _clear_pending_outreach(user_id)
 
     keyboard = {
         "inline_keyboard": [[{
@@ -2313,7 +2972,8 @@ def handle_transcriber_chat_update(update):
             "1) أرسل الملف الصوتي أو الفيديو في هذه المحادثة، "
             "أو الصق رابط يوتيوب أو رابط ملف مباشر.\n"
             "2) انتظر، وستصلك النسخة الخام ثم المصححة والمحسّنة.\n"
-            "3) نزّل DOCX أو TXT من الأزرار أسفل النتيجة.\n\n"
+            "3) نزّل DOCX أو TXT من الأزرار أسفل النتيجة.\n"
+            "4) بعد اكتمال التدقيق يظهر تقييم سريع؛ تقييمك يصل للمطوّر مباشرة.\n\n"
             "🔍 /find كلمة — البحث في تفريغاتك.\n"
             "🔍 /find — آخر تفريغاتك.\n"
             "🗂️ كل تفريغ يُحفظ في أرشيفك الخاص.\n"
@@ -2343,12 +3003,28 @@ def handle_transcriber_chat_update(update):
     elif command == "/cancel":
         with _CONTACT_LOCK:
             _CONTACT_PENDING.pop(str(user_id), None)
-        reply = "أُلغي وضع كتابة رسالة التواصل."
+        _clear_pending_outreach(user_id)
+        reply = "أُلغي وضع كتابة الرسالة."
     elif command == "/stats":
         handle_stats(chat_id, user_id)
         return
     elif command == "/users":
         handle_users(chat_id, user_id)
+        return
+    elif command == "/allusers":
+        handle_allusers(chat_id, user_id)
+        return
+    elif command == "/block":
+        handle_block_command(chat_id, user_id, argument)
+        return
+    elif command == "/unblock":
+        handle_unblock_command(chat_id, user_id, argument)
+        return
+    elif command == "/blocked":
+        handle_blocked_list(chat_id, user_id)
+        return
+    elif command == "/msg":
+        handle_msg_command(chat_id, user_id, argument)
         return
     elif command == "/cookies":
         handle_cookies_command(chat_id, user_id, argument)
@@ -2983,7 +3659,7 @@ def _refined_keyboard(job_id, kinds):
 
 
 def handle_transcriber_callback(update):
-    """أزرار التصدير بصيغة f:<job_id>:<kind>:<fmt>."""
+    """أزرار التصدير f:<job>:<kind>:<fmt> وأزرار التقييم fb:<job>:<verdict>."""
     callback = update.get("callback_query") or {}
     if not callback:
         return
@@ -2999,6 +3675,25 @@ def handle_transcriber_callback(update):
         f"[CALLBACK] id={callback_id} user={user_id} data={data!r}",
         flush=True
     )
+
+    # المحجوب: أزرار لا تصدير ولا تقييم.
+    if (
+        user_id
+        and not is_developer(user_id)
+        and is_blocked(user_id)
+    ):
+        handle_blocked_gate(user_id)
+        answer_callback(callback_id, "تم إيقاف استخدامك لهذه الخدمة", alert=True)
+        return
+
+    if data.startswith("fb:"):
+        try:
+            _, raw_job_id, choice = data.split(":", 2)
+        except ValueError:
+            answer_callback(callback_id, "خيار غير صالح", alert=True)
+            return
+        answer_feedback_callback(callback_id, choice.strip(), raw_job_id, callback)
+        return
 
     if not data.startswith("f:"):
         answer_callback(callback_id, "خيار غير معروف")
@@ -3252,6 +3947,8 @@ def send_refined_versions_async(job_id, raw_output_file):
                 keyboard
             )
             delete_status_message(job_id, prefix="refine")
+            # لوحة التقييم تظهر بعد إفاش النسختين، ليس قبلها.
+            send_feedback_prompt(job_id, telegram_user_id)
         except Exception as e:
             print(f"[AUTO-REFINE] Panel message failed: {e}", flush=True)
             update_status_message(
@@ -3276,6 +3973,8 @@ def send_refined_versions_async(job_id, raw_output_file):
                     flush=True
                 )
         delete_status_message(job_id, prefix="refine")
+        # ذا تعذّرت الأزرار، التقييم يبقى يظهر مرة واحدة بعد التسليم.
+        send_feedback_prompt(job_id, telegram_user_id)
 
 
 # ============================================================
