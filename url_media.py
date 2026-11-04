@@ -276,6 +276,8 @@ def _download_direct(url, destination_dir, max_bytes):
 
 
 # عبارات تظهر في خطأ يوتيوب عندما يطلب التحقق من أن الطلب ليس آليًا.
+# «Failed to extract any player response» غالبًا نفس الحجب لكن بعبارات
+# كليّة في النسخ الحديثة؛ من دونها لن تُجرَّب العملاء البدلاء أصلًا.
 BOT_CHECK_HINTS = (
     "sign in to confirm",
     "not a bot",
@@ -284,10 +286,12 @@ BOT_CHECK_HINTS = (
     "use --cookies",
     "cookies-from-browser",
     "login required",
+    "failed to extract any player response",
+    "unable to extract player response",
 )
 
-# عميل بديل يُجرَّب مرة واحدة إن حجب يوتيوب العميل الافتراضي.
-YOUTUBE_ALT_CLIENTS = ("tv", "android_vr")
+# عملاء بديلة يُجرَّبون معًا إن حجب يوتيوب العميل الافتراضي.
+YOUTUBE_ALT_CLIENTS = ("tv", "web_safari", "android_vr")
 
 
 def _short_reason(error):
@@ -436,7 +440,19 @@ def _youtube_options(destination_dir, max_bytes, cookies_file=None, clients=None
         options["extractor_args"] = {
             "youtube": {"player_client": list(clients)}
         }
+    # مخرج اختياري إن حجب يوتيوب عنوان الخادم نهائيًا.
+    proxy = os.environ.get("YTDLP_PROXY", "").strip()
+    if proxy:
+        options["proxy"] = proxy
     return options
+
+
+def _yt_version():
+    try:
+        import yt_dlp
+        return yt_dlp.version.__version__
+    except Exception:
+        return "غير معروفة"
 
 
 def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
@@ -447,6 +463,7 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
             "دعم يوتيوب غير مثبّت على الخادم."
         ) from e
 
+    version = _yt_version()
     cookies_file, temporary_cookies = _youtube_cookies_file(
         destination_dir,
         cookies_text
@@ -469,7 +486,8 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
             except Exception as e:
                 last_message = str(e)
                 print(
-                    f"[YTDLP] {clients or 'default'} failed: "
+                    f"[YTDLP] yt-dlp {version} "
+                    f"{clients or 'default'} failed: "
                     f"{_short_reason(e)}",
                     flush=True
                 )
