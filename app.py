@@ -199,6 +199,7 @@ DEVELOPER_ONLY_COMMANDS = [
     {"command": "users", "description": "آخر 20 مستخدمًا"},
     {"command": "allusers", "description": "كل المستخدمين من التأسيس"},
     {"command": "cookies", "description": "حالة كوكيز يوتيوب"},
+    {"command": "ytinfo", "description": "فحص صيغ رابط يوتيوب: /ytinfo الرابط"},
     {"command": "block", "description": "إيقاف مستخدم: /block معرفه"},
     {"command": "unblock", "description": "إلغاء إيقاف مستخدم"},
     {"command": "blocked", "description": "قائمة المحجوبين"},
@@ -567,28 +568,29 @@ def handle_allusers(chat_id, user_id):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                # الفصل الأسماء المؤهَّلة؛ created_at موجود في الجدولين.
                 cur.execute("""
                     SELECT
-                        data->>'telegram_user_id' AS user_id,
-                        MIN(created_at) AS first_seen,
-                        MAX(created_at) AS last_seen,
+                        j.data->>'telegram_user_id' AS user_id,
+                        MIN(j.created_at) AS first_seen,
+                        MAX(j.created_at) AS last_seen,
                         COUNT(*) AS jobs,
                         COALESCE(
-                            MAX(NULLIF(data->>'telegram_username', '')),
+                            MAX(NULLIF(j.data->>'telegram_username', '')),
                             ''
                         ) AS username,
                         COALESCE(
-                            MAX(NULLIF(data->>'telegram_name', '')),
+                            MAX(NULLIF(j.data->>'telegram_name', '')),
                             ''
                         ) AS name,
                         (b.user_id IS NOT NULL) AS blocked
                     FROM jobs j
                     LEFT JOIN blocked_users b
-                        ON b.user_id = data->>'telegram_user_id'
-                    WHERE data->>'telegram_user_id' IS NOT NULL
-                      AND data->>'telegram_user_id' <> ''
+                        ON b.user_id = j.data->>'telegram_user_id'
+                    WHERE j.data->>'telegram_user_id' IS NOT NULL
+                      AND j.data->>'telegram_user_id' <> ''
                     GROUP BY 1, b.user_id
-                    ORDER BY MIN(created_at) ASC
+                    ORDER BY MIN(j.created_at) ASC
                 """)
                 rows = cur.fetchall()
     except Exception as e:
@@ -1154,6 +1156,12 @@ def _webhook_check_startup():
         ensure_webhook_updates()
     except Exception as e:
         print(f"[WEBHOOK CHECK] Warning: {e}", flush=True)
+
+    # بيئة تنزيل يوتيوب في السجل: نسخة yt-dlp وتوفر بيئة JS.
+    try:
+        url_media.log_ytdlp_runtime()
+    except Exception as e:
+        print(f"[YTDLP] runtime log warning: {e}", flush=True)
 
     # قائمة الأوامر بعد علامة /: تسجيل غير متكرّر ولشاشة قليلة التكلفة.
     try:
@@ -2793,6 +2801,73 @@ def handle_cookies_upload(message, chat_id):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def handle_ytinfo_command(chat_id, user_id, argument):
+    """فحص تشخيصي للمطوّر: الصيغ التي يقدمها يوتيوب لرابط من هذا الخادم."""
+    if not is_developer(user_id):
+        telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
+        return
+
+    url = (argument or "").strip()
+    if not url:
+        telegram_send_message(chat_id, "استخدم: /ytinfo <رابط يوتيوب>")
+        return
+
+    work_dir = Path("/tmp") / f"waqqad_ytinfo_{uuid.uuid4().hex}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        try:
+            cookies_text = get_setting(YOUTUBE_COOKIES_KEY)
+        except Exception as e:
+            print(f"[YTINFO] cookies read failed: {e}", flush=True)
+            cookies_text = None
+
+        info = url_media.inspect_youtube(url, work_dir, cookies_text=cookies_text)
+        formats = (info or {}).get("formats") or []
+        audible = [
+            f for f in formats
+            if f.get("acodec") not in (None, "none")
+        ]
+        merged = [
+            f for f in formats
+            if f.get("acodec") not in (None, "none")
+            and f.get("vcodec") not in (None, "none")
+        ]
+        title = str((info or {}).get("title") or "بدون عنوان").strip()
+        cookies_state = "مع الكوكيز" if cookies_text else "بدون كوكيز"
+
+        lines = [
+            f"ℹ️ {title}",
+            f"🧾 نسخة yt-dlp: {url_media._yt_version()}"
+            f" — الكوكيز: {cookies_state}",
+            f"📀 الصيغ: {len(formats)}"
+            f" — تصلح للصوت فقط: {len(audible)}"
+            f" — مدمجة (صوت+صورة): {len(merged)}",
+            "",
+            "أول 10 صيغ:",
+        ]
+        for f in formats[:10]:
+            audio = "🔊" if f.get("acodec") not in (None, "none") else "🎥"
+            lines.append(
+                f"{audio} {f.get('format_id')} ({f.get('ext')}) "
+                f"صوت: {f.get('acodec')} صورة: {f.get('vcodec')}"
+            )
+
+        message = "\n".join(lines)
+        telegram_send_message(
+            chat_id,
+            message if len(message) < 3900 else message[:3900]
+        )
+        print(f"[YTINFO] {url} -> {len(formats)} formats", flush=True)
+    except Exception as e:
+        print(f"[YTINFO] inspect failed: {e}", flush=True)
+        telegram_send_message(
+            chat_id,
+            f"⚠️ فشل الفحص: {url_media._short_reason(e)}"
+        )
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 def handle_cookies_command(chat_id, user_id, argument):
     if not is_developer(user_id):
         telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
@@ -3028,6 +3103,9 @@ def handle_transcriber_chat_update(update):
         return
     elif command == "/cookies":
         handle_cookies_command(chat_id, user_id, argument)
+        return
+    elif command == "/ytinfo":
+        handle_ytinfo_command(chat_id, user_id, argument)
         return
     elif command == "/find":
         handle_find(chat_id, user_id, argument)
