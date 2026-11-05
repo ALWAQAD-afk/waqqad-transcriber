@@ -430,7 +430,13 @@ def _youtube_cookies_file(destination_dir, cookies_text=None):
     return path, True
 
 
-def _youtube_options(destination_dir, max_bytes, cookies_file=None, clients=None):
+def _youtube_options(
+    destination_dir,
+    max_bytes,
+    cookies_file=None,
+    clients=None,
+    missing_pot=False,
+):
     options = {
         "format": "bestaudio/best",
         "noplaylist": True,
@@ -452,15 +458,38 @@ def _youtube_options(destination_dir, max_bytes, cookies_file=None, clients=None
 
     if cookies_file:
         options["cookiefile"] = str(cookies_file)
+
+    # يوتيوب يحجب الصيغ التي تحتاج PO Token إن لم يتوفر، فلا تظهر أصلًا.
+    # إدراجها اختياري: نحاول أولًا الوضع الطبيعي، ثم نضيفها في محاولات
+    # لاحقة (قد تنجح، وقد ترجع 403 — نجرب ولا نخسر المحاولات الأخرى).
+    youtube_args = {}
     if clients:
-        options["extractor_args"] = {
-            "youtube": {"player_client": list(clients)}
-        }
+        youtube_args["player_client"] = list(clients)
+    if missing_pot:
+        youtube_args["formats"] = ["missing_pot"]
+    if youtube_args:
+        options["extractor_args"] = {"youtube": youtube_args}
     # مخرج اختياري إن حجب يوتيوب عنوان الخادم نهائيًا.
     proxy = os.environ.get("YTDLP_PROXY", "").strip()
     if proxy:
         options["proxy"] = proxy
     return options
+
+
+# أخطاء تعني أن الفيديو نفسه غير متاح؛ لا فائدة من تجربة عملاء آخرين.
+FATAL_YOUTUBE_HINTS = (
+    "video unavailable",
+    "private video",
+    "this video is private",
+    "removed by the uploader",
+    "members-only",
+    "who has blocked it",
+)
+
+
+def _youtube_error_is_fatal(message):
+    lower = (message or "").lower()
+    return any(hint in lower for hint in FATAL_YOUTUBE_HINTS)
 
 
 def _yt_version():
@@ -490,6 +519,68 @@ def js_runtime_state():
     return "غير متوفر — ستعطي يوتيوب صيغًا ناقصة"
 
 
+def _parse_netscape_cookies(cookies_text):
+    """يحوّل ملف كوكيز Netscape إلى قاموس name -> value."""
+    cookies = {}
+    for raw_line in (cookies_text or "").splitlines():
+        line = raw_line.strip("\r\n")
+        if not line:
+            continue
+        if line.startswith("#") and not line.startswith("#HttpOnly_"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        name, value = parts[5].strip(), parts[6].strip()
+        if name:
+            cookies[name] = value
+    return cookies
+
+
+def _cookie_login_state_from_html(html_text):
+    """True مسجّل، False غير مسجّل، None غير واضح."""
+    if re.search(r'"LOGGED_IN"\s*:\s*true', html_text or ""):
+        return True
+    if re.search(r'"LOGGED_IN"\s*:\s*false', html_text or ""):
+        return False
+    return None
+
+
+def youtube_cookie_status(cookies_text, timeout=20):
+    """يفحص هل كوكيز الحساب ما زالت فعّالة من عنوان الخادم.
+
+    يوتيوب قد يقبل ملف كوكيز شكله صحيح لكن جلسته منتهية، فتأتي النتيجة
+    «قصص فقط». هذا الفحص يفصل بين «كوكيز ميتة» و«حجب صيغ» فورًا.
+    """
+    cookies = _parse_netscape_cookies(cookies_text)
+    if not cookies:
+        return "لا توجد كوكيز صالحة الشكل"
+
+    try:
+        response = requests.get(
+            "https://www.youtube.com/",
+            cookies=cookies,
+            timeout=timeout,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "ar,en;q=0.8",
+            },
+        )
+    except requests.RequestException as e:
+        return f"تعذّر فحص الحساب ({type(e).__name__})"
+
+    state = _cookie_login_state_from_html(response.text)
+    if state is True:
+        return "الحساب مسجّل الدخول ✅"
+    if state is False:
+        return "الكوكيز منتهية أو ناقصة ❌ — أعد تصديرها من المتصفح"
+    return "تعذّر تحديد حالة الحساب (يوتيوب لم يفصح عنها)"
+
+
 def inspect_youtube(url, destination_dir, cookies_text=None, clients=None):
     """فحص للمطوّر: ما الصيغ التي يقدمها يوتيوب من هذا الخادم فعلًا؟
 
@@ -507,6 +598,7 @@ def inspect_youtube(url, destination_dir, cookies_text=None, clients=None):
         10_000_000_000,
         cookies_file,
         clients,
+        missing_pot=True,
     )
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -535,25 +627,30 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
     info = None
     last_message = ""
 
-    cookie_attempts = (None, YOUTUBE_ALT_CLIENTS, YOUTUBE_LAST_CLIENTS)
-    bare_attempt = YOUTUBE_BARE_CLIENTS if cookies_text else None
-    attempts = list(cookie_attempts)
-    if bare_attempt:
-        attempts.append(bare_attempt)
+    # نحاول الوضع الطبيعي أولًا (لا نكسر ما يعمل)، ثم بإدراج صيغ
+    # «missing PO Token»، ثم عملاء بدلاء، وأخيرًا بلا كوكيز.
+    attempts = [
+        (None, False, cookies_file),
+        (None, True, cookies_file),
+        (YOUTUBE_ALT_CLIENTS, True, cookies_file),
+        (YOUTUBE_LAST_CLIENTS, True, cookies_file),
+    ]
+    if cookies_text:
+        attempts.append((YOUTUBE_BARE_CLIENTS, True, None))
 
     try:
-        for attempt in attempts:
-            label = attempt or 'default'
-            # المحاولة الأخيرة بلا كوكيز: البحث عن عميل يمنح الصيغ
-            # من عنوان الخادم دون حساب.
-            use_cookies = cookies_file if attempt is not bare_attempt else None
-            if attempt is bare_attempt:
-                label = "bare (بدون كوكيز)"
+        for clients, allow_missing_pot, use_cookies in attempts:
+            label = "+".join(clients) if clients else "default"
+            if allow_missing_pot:
+                label += " +missing_pot"
+            if use_cookies is None:
+                label += " (بدون كوكيز)"
             options = _youtube_options(
                 destination_dir,
                 max_bytes,
                 use_cookies,
-                attempt,
+                clients,
+                missing_pot=allow_missing_pot,
             )
             try:
                 with yt_dlp.YoutubeDL(options) as ydl:
@@ -567,11 +664,8 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
                     f"{_short_reason(e)}",
                     flush=True
                 )
-                # المحاولات الإضافية مخصّصة لحجب يوتيوب فقط؛ غير ذلك فشل فوري.
-                if (
-                    attempt not in (None, bare_attempt)
-                    and not _looks_like_bot_check(last_message)
-                ):
+                # خطأ يعني أن الفيديو نفسه غير متاح: لا نكمل المحاولات.
+                if _youtube_error_is_fatal(last_message):
                     raise _youtube_failure(last_message) from e
 
         if info is None:

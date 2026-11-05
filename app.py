@@ -2880,15 +2880,24 @@ def handle_ytinfo_command(chat_id, user_id, argument):
             except Exception as e:
                 print(f"[YTINFO] cookies read failed: {e}", flush=True)
                 cookies_text = None
+            cookie_state = (
+                url_media.youtube_cookie_status(cookies_text)
+                if cookies_text
+                else "لا توجد كوكيز محفوظة"
+            )
 
             probes = [
                 ("الافتراضي", None),
                 ("visionos", ("visionos",)),
                 ("web_safari", ("web_safari",)),
+                ("tv", ("tv",)),
+                ("tv_samsung", ("tv_samsung",)),
+                ("tv_simply", ("tv_simply",)),
                 ("tv_downgraded", ("tv_downgraded",)),
                 ("web", ("web",)),
-                ("web_embedded", ("web_embedded",)),
+                ("web_creator", ("web_creator",)),
                 ("mweb", ("mweb",)),
+                ("android_vr", ("android_vr",)),
                 ("android", ("android",)),
                 ("ios", ("ios",)),
             ]
@@ -2959,6 +2968,7 @@ def handle_ytinfo_command(chat_id, user_id, argument):
                 f"ℹ️ سبر: {url}{title_part}\n"
                 f"🧾 نسخة: {url_media._yt_version()}"
                 f" — 🖥️ بيئة JS: {runtime}\n"
+                f"🍪 حالة الحساب: {cookie_state}\n"
                 f"🍪 الافتراضيات مع الكوكيز — 🚫 آخر سطر بدونها\n"
                 "------------------------------"
             )
