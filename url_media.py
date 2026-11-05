@@ -299,7 +299,7 @@ YOUTUBE_LAST_CLIENTS = ("tv_downgraded", "android_vr", "ios")
 # آخر محاولة من غير الكوكيز إن رفضت يوتيوب كل المحاولات بالكوكيز.
 # من دون كوكيز يستخدم yt-dlp تلقائيًا عملاء لا يحتاجون حسابًا، وقد
 # تمنح صيغًا من عنوان الخادم بعد حل التحدي الجديد (بيئة JS).
-YOUTUBE_BARE_CLIENTS = ("android_vr", "web_safari", "ios")
+YOUTUBE_BARE_CLIENTS = ("visionos", "android_vr", "web_safari", "ios")
 
 
 def _short_reason(error):

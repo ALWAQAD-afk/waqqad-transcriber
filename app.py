@@ -2832,6 +2832,7 @@ def handle_ytinfo_command(chat_id, user_id, argument):
 
             probes = [
                 ("الافتراضي", None),
+                ("visionos", ("visionos",)),
                 ("web_safari", ("web_safari",)),
                 ("tv_downgraded", ("tv_downgraded",)),
                 ("web", ("web",)),
