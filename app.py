@@ -15,6 +15,7 @@ from pathlib import Path
 from warraq import handle_warraq_update
 from warraq_miniapp import register_warraq_miniapp
 from command_text import normalize_command_text
+from update_gate import SeenUpdates, is_stale_message
 import requests
 
 # --- إضافة التنقيح v3 - نظام 3 ملفات تلقائي + تقسيم دفعات ---
@@ -612,12 +613,16 @@ def handle_allusers(chat_id, user_id):
         + (f" (منهم محجوب: {blocked_total})" if blocked_total else "")
     ]
 
+    lookups = 0
     for index, row in enumerate(rows, start=1):
         tg_id = row.get("user_id") or "غير معروف"
         username = str(row.get("username") or "").strip().lstrip("@")
         name = str(row.get("name") or "").strip()
 
-        if not username:
+        # لا نستعلم تيليجرام لكل مستخدم: قائمة ضخمة + بطء. عشر محاولات
+        # فقط لسدّ أقدم المعرّفات، والباقي يظهر بمعرّفه.
+        if not username and lookups < 10:
+            lookups += 1
             info = telegram_get_chat(tg_id)
             if info:
                 username = str(
@@ -782,8 +787,14 @@ CONTACT_MAX_CHARS = 3000
 # بعد /ytinfo بلا رابط: الرابط في الرسالة التالية يُفحص هو نفسه بدل
 # إنشاء مهمة تفريغ. شائع لأن قائمة أوامر تيليجرام ترسل الأمر وحده.
 _YTINFO_PENDING = {}
+_YTINFO_RUNNING = set()
 _YTINFO_LOCK = threading.Lock()
 YTINFO_WINDOW_SECONDS = 5 * 60
+
+# تيليجرام يعيد إرسال التحديث نفسه إذا لم يصل الردّ بسرعة. أوامر ثقيلة
+# مثل /allusers كانت تجعل الحلقة تدور وتحجب كل الأوامر التالية.
+_SEEN_UPDATES = SeenUpdates()
+STALE_MESSAGE_SECONDS = 5 * 60
 
 
 def _mark_pending_ytinfo(user_id):
@@ -2848,10 +2859,21 @@ def handle_ytinfo_command(chat_id, user_id, argument):
         )
         return
 
+    # فحص واحد لكل مستخدم في الوقت نفسه؛ منع تكدّس الفحوص.
+    pending_key = str(user_id)
+    with _YTINFO_LOCK:
+        if pending_key in _YTINFO_RUNNING:
+            telegram_send_message(
+                chat_id,
+                "⏳ يوجد فحص قيد التنفيذ الآن؛ سأرسل نتيجته فور الانتهاء."
+            )
+            return
+        _YTINFO_RUNNING.add(pending_key)
+
     def _sweep():
         work_dir = Path("/tmp") / f"waqqad_ytinfo_{uuid.uuid4().hex}"
-        work_dir.mkdir(parents=True, exist_ok=True)
         try:
+            work_dir.mkdir(parents=True, exist_ok=True)
             runtime = url_media.js_runtime_state()
             try:
                 cookies_text = get_setting(YOUTUBE_COOKIES_KEY)
@@ -2964,6 +2986,8 @@ def handle_ytinfo_command(chat_id, user_id, argument):
             except Exception:
                 pass
         finally:
+            with _YTINFO_LOCK:
+                _YTINFO_RUNNING.discard(pending_key)
             shutil.rmtree(work_dir, ignore_errors=True)
 
     thread = threading.Thread(
@@ -2971,7 +2995,17 @@ def handle_ytinfo_command(chat_id, user_id, argument):
         name="ytinfo-sweep",
         daemon=True
     )
-    thread.start()
+    try:
+        thread.start()
+    except Exception as e:
+        with _YTINFO_LOCK:
+            _YTINFO_RUNNING.discard(pending_key)
+        print(f"[YTINFO] could not start sweep: {e}", flush=True)
+        telegram_send_message(
+            chat_id,
+            "⚠️ تعذّر بدء الفحص على الخادم. أعد المحاولة بعد قليل."
+        )
+        return
     print(f"[YTINFO] sweep started for {url}", flush=True)
 
 def handle_cookies_command(chat_id, user_id, argument):
@@ -3205,10 +3239,20 @@ def handle_transcriber_chat_update(update):
         handle_stats(chat_id, user_id)
         return
     elif command == "/users":
-        handle_users(chat_id, user_id)
+        threading.Thread(
+            target=handle_users,
+            args=(chat_id, user_id),
+            name="users-list",
+            daemon=True
+        ).start()
         return
     elif command == "/allusers":
-        handle_allusers(chat_id, user_id)
+        threading.Thread(
+            target=handle_allusers,
+            args=(chat_id, user_id),
+            name="allusers-list",
+            daemon=True
+        ).start()
         return
     elif command == "/block":
         handle_block_command(chat_id, user_id, argument)
@@ -4557,6 +4601,22 @@ def transcriber_webhook():
         f"keys={list(update.keys())}",
         flush=True
     )
+
+    # نفس التحديث قد يصل مرات إذا تأخّر ردّنا؛ ننفّذه مرة واحدة فقط.
+    if _SEEN_UPDATES.seen(update.get("update_id")):
+        print(
+            "[TRANSCRIBER WEBHOOK] duplicate update ignored",
+            flush=True
+        )
+        return jsonify({"status": "ok"}), 200
+
+    # رسالة عادية قديمة جدًا (خدمة كانت نائمة) لا معنى لتنفيذها الآن.
+    if is_stale_message(update, STALE_MESSAGE_SECONDS):
+        print(
+            "[TRANSCRIBER WEBHOOK] stale message ignored",
+            flush=True
+        )
+        return jsonify({"status": "ok"}), 200
 
     try:
         if update.get("callback_query"):
