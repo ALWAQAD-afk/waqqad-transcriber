@@ -171,6 +171,16 @@ class TestYoutubeErrors(unittest.TestCase):
         )
         self.assertIsInstance(error, url_media.UrlTooLarge)
 
+    def test_no_playable_format_is_explained_as_server_side(self):
+        """يوتيوب قد يُرجع الاستخراج بلا صيغ صوتية من عنوان الخادم."""
+        error = url_media._youtube_failure(
+            "ERROR: [youtube] abc: Requested format is not available. "
+            "Use --list-formats for a list of available formats"
+        )
+        self.assertIsInstance(error, url_media.UrlDownloadError)
+        self.assertIn("بيئة الخادم", str(error))
+        self.assertIn("Requested format", error.detail)
+
     def test_short_reason_is_one_line(self):
         reason = url_media._short_reason(
             "ERROR: first line\nsecond line   with spaces"
@@ -270,6 +280,62 @@ class TestYoutubeCookies(unittest.TestCase):
             url_media._looks_like_bot_check(
                 "[youtube] abc123: Failed to extract any player response;"
             )
+        )
+
+    def test_bare_attempt_runs_without_cookies_before_giving_up(self):
+        """إن فشلت كل محاولات الكوكيز تُجرَّب محاولة أخيرة بلا كوكيز."""
+        import sys
+        import types
+
+        sys.modules.pop("yt_dlp", None)
+
+        calls = []
+
+        class FakeYDL:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=True):
+                calls.append(self.options)
+                if self.options.get("cookiefile"):
+                    raise RuntimeError(
+                        "[youtube] abc: Sign in to confirm you're not a bot"
+                    )
+                home = Path(self.options["paths"]["home"])
+                (home / "lecture.mp3").write_bytes(b"audio")
+                return {"title": "ok", "formats": []}
+
+        fake_module = types.ModuleType("yt_dlp")
+        fake_module.version = types.SimpleNamespace(__version__="2026.10.26")
+        fake_module.YoutubeDL = FakeYDL
+
+        cookies = (
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n"
+        )
+
+        with TemporaryDirectory() as temp:
+            with mock.patch.dict(sys.modules, {"yt_dlp": fake_module}):
+                info = url_media._download_youtube(
+                    "https://www.youtube.com/watch?v=abc",
+                    Path(temp),
+                    1000,
+                    cookies_text=cookies,
+                )
+
+        self.assertEqual(info[2], "ok")
+        # ثلاث محاولات بالكوكيز ثم محاولة أخيرة بلا كوكيز.
+        self.assertEqual(len(calls), 4)
+        self.assertIsNone(calls[-1].get("cookiefile"))
+        self.assertEqual(
+            calls[-1]["extractor_args"]["youtube"]["player_client"],
+            list(url_media.YOUTUBE_BARE_CLIENTS)
         )
 
 
