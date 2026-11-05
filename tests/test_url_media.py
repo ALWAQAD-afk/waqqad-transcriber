@@ -267,12 +267,33 @@ class TestYoutubeCookies(unittest.TestCase):
     def test_options_include_alternate_client(self):
         with TemporaryDirectory() as temp:
             options = url_media._youtube_options(
-                Path(temp), 1024, None, ("tv", "android_vr")
+                Path(temp), 1024, None, ("tv", "android_vr"),
+                missing_pot=True,
             )
             self.assertEqual(
                 options["extractor_args"]["youtube"]["player_client"],
                 ["tv", "android_vr"]
             )
+            # الصيغ التي تحتاج PO Token تُدرج عند طلبها.
+            self.assertIn(
+                "missing_pot",
+                options["extractor_args"]["youtube"]["formats"]
+            )
+
+    def test_options_include_missing_pot_without_clients(self):
+        with TemporaryDirectory() as temp:
+            options = url_media._youtube_options(
+                Path(temp), 1024, None, missing_pot=True
+            )
+            self.assertEqual(
+                options["extractor_args"]["youtube"]["formats"],
+                ["missing_pot"]
+            )
+
+    def test_options_omit_missing_pot_by_default(self):
+        with TemporaryDirectory() as temp:
+            options = url_media._youtube_options(Path(temp), 1024, None)
+            self.assertNotIn("extractor_args", options)
 
     def test_player_response_failure_counts_as_block(self):
         """هذا الخطأ كان يتجاوز المحاولة البديلة سابقًا."""
@@ -330,12 +351,61 @@ class TestYoutubeCookies(unittest.TestCase):
                 )
 
         self.assertEqual(info[2], "ok")
-        # ثلاث محاولات بالكوكيز ثم محاولة أخيرة بلا كوكيز.
-        self.assertEqual(len(calls), 4)
+        # أربع محاولات بالكوكيز ثم محاولة أخيرة بلا كوكيز.
+        self.assertEqual(len(calls), 5)
         self.assertIsNone(calls[-1].get("cookiefile"))
         self.assertEqual(
             calls[-1]["extractor_args"]["youtube"]["player_client"],
             list(url_media.YOUTUBE_BARE_CLIENTS)
+        )
+        # المحاولة الأولى طبيعية، والثانية تُدرج صيغ missing PO Token.
+        self.assertNotIn("extractor_args", calls[0])
+        self.assertIn(
+            "missing_pot",
+            calls[1]["extractor_args"]["youtube"]["formats"]
+        )
+
+
+class TestCookieStatus(unittest.TestCase):
+    def test_parses_netscape_cookies(self):
+        text = (
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tone\n"
+            "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tHSID\ttwo\n"
+        )
+        self.assertEqual(
+            url_media._parse_netscape_cookies(text),
+            {"SID": "one", "HSID": "two"}
+        )
+
+    def test_detects_logged_in_html(self):
+        self.assertTrue(
+            url_media._cookie_login_state_from_html(
+                'ytcfg.set({"LOGGED_IN":true,"X":1});'
+            )
+        )
+        self.assertTrue(
+            url_media._cookie_login_state_from_html(
+                '"LOGGED_IN" : true'
+            )
+        )
+
+    def test_detects_logged_out_html(self):
+        self.assertFalse(
+            url_media._cookie_login_state_from_html(
+                '{"LOGGED_IN":false}'
+            )
+        )
+
+    def test_unknown_html_returns_none(self):
+        self.assertIsNone(
+            url_media._cookie_login_state_from_html("<html></html>")
+        )
+
+    def test_status_without_cookies(self):
+        self.assertIn(
+            "لا توجد كوكيز",
+            url_media.youtube_cookie_status("")
         )
 
 
