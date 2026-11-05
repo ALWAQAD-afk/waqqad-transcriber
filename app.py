@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl
 from pathlib import Path
 from warraq import handle_warraq_update
 from warraq_miniapp import register_warraq_miniapp
+from command_text import normalize_command_text
 import requests
 
 # --- إضافة التنقيح v3 - نظام 3 ملفات تلقائي + تقسيم دفعات ---
@@ -777,6 +778,32 @@ _CONTACT_REPLIES = {}
 _CONTACT_LOCK = threading.Lock()
 CONTACT_WINDOW_SECONDS = 30 * 60
 CONTACT_MAX_CHARS = 3000
+
+# بعد /ytinfo بلا رابط: الرابط في الرسالة التالية يُفحص هو نفسه بدل
+# إنشاء مهمة تفريغ. شائع لأن قائمة أوامر تيليجرام ترسل الأمر وحده.
+_YTINFO_PENDING = {}
+_YTINFO_LOCK = threading.Lock()
+YTINFO_WINDOW_SECONDS = 5 * 60
+
+
+def _mark_pending_ytinfo(user_id):
+    with _YTINFO_LOCK:
+        _YTINFO_PENDING[str(user_id)] = time.time()
+
+
+def _consume_pending_ytinfo(user_id):
+    """يعيد True إن كان المستخدم ينتظر إرسال رابط لفحص /ytinfo."""
+    key = str(user_id)
+    with _YTINFO_LOCK:
+        started = _YTINFO_PENDING.pop(key, None)
+    if started is None:
+        return False
+    return time.time() - started <= YTINFO_WINDOW_SECONDS
+
+
+def _clear_pending_ytinfo(user_id):
+    with _YTINFO_LOCK:
+        _YTINFO_PENDING.pop(str(user_id), None)
 
 # مراسلة المطوّر للمستخدمين دون أن يراسلوه أولًا.
 # _PENDING_TO: وضع «سأرسل رسالتي التالية إلى عميل X».
@@ -2812,10 +2839,12 @@ def handle_ytinfo_command(chat_id, user_id, argument):
 
     url = (argument or "").strip()
     if not url:
+        _mark_pending_ytinfo(user_id)
         telegram_send_message(
             chat_id,
             "استخدم: /ytinfo <رابط يوتيوب>\n"
-            "سأفحص عدة عملاء مع الكوكيز والبدون؛ قد يستغرق حتى دقيقة."
+            "أو أرسل رابط يوتيوب في الرسالة التالية الآن؛ "
+            "سأفحصه بدل تفريغه."
         )
         return
 
@@ -3038,6 +3067,11 @@ def handle_transcriber_chat_update(update):
         return
 
     raw_text = (message.get("text") or "").strip()
+    # لوحة مفاتيح عربية قد تكتب محرفًا شبيهًا بـ"/"؛ نطبّعه قبل التحليل.
+    raw_text = normalize_command_text(
+        raw_text,
+        developer=is_developer(user_id),
+    )
 
     # رسالة المطوّر أثناء وضع /msg تمرّر إلى المستخدم المقصود.
     if is_developer(user_id) and raw_text and not raw_text.startswith("/"):
@@ -3063,6 +3097,14 @@ def handle_transcriber_chat_update(update):
     ):
         _forward_contact(chat_id, user_id, sender, raw_text)
         return
+
+    # بعد /ytinfo بلا رابط: الرابط التالي يُفحص بدل إنشاء مهمة تفريغ.
+    if is_developer(user_id) and raw_text and not raw_text.startswith("/"):
+        if _consume_pending_ytinfo(user_id):
+            found_url = url_media.extract_url(raw_text)
+            if found_url:
+                handle_ytinfo_command(chat_id, user_id, found_url)
+                return
 
     # رابط يوتيوب أو رابط ملف مباشر يُفرّغ تلقائيًا.
     if chat.get("type") == "private" and raw_text and not raw_text.startswith("/"):
@@ -3090,15 +3132,17 @@ def handle_transcriber_chat_update(update):
             )
         return
 
-    command, _, argument = raw_text.partition(" ")
-    command = command.split("@", 1)[0].lower()
-    argument = argument.strip()
+    # فراغ أو سطر جديد بعد الأمر لا يفسد الوسيط.
+    parts = raw_text.split(None, 1)
+    command = parts[0].split("@", 1)[0].lower() if parts else ""
+    argument = parts[1].strip() if len(parts) > 1 else ""
 
     # أي أمر آخر ينهي وضع كتابة رسالة تواصل أو رسالة مُوجَّهة للمطوّر.
     if command not in ("/contact", "/msg"):
         with _CONTACT_LOCK:
             _CONTACT_PENDING.pop(str(user_id), None)
         _clear_pending_outreach(user_id)
+        _clear_pending_ytinfo(user_id)
 
     keyboard = {
         "inline_keyboard": [[{
