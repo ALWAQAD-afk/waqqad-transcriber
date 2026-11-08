@@ -36,3 +36,12 @@ jobs:
               --extractor-args "youtubepot-bgutilscript:server_home=/opt/bgutil/server" \
               --extractor-args "youtube:player_client=web;formats=missing_pot" \
               "https://www.youtube.com/watch?v=YKLXKyhUmMs" 2>&1 | tail -80'
+
+      - name: Probe YouTube with forced PO token
+        timeout-minutes: 15
+        run: |
+          docker run --rm --entrypoint /bin/sh waqqad-transcriber:check -c \
+            'yt-dlp -v --skip-download --no-warnings \
+              --extractor-args "youtubepot-bgutilscript:server_home=/opt/bgutil/server" \
+              --extractor-args "youtube:player_client=mweb;formats=missing_pot;fetch_pot=always;pot_trace=true" \
+              "https://www.youtube.com/watch?v=YKLXKyhUmMs" 2>&1 | tail -120'
