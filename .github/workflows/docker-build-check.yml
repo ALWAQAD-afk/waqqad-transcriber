@@ -45,3 +45,19 @@ jobs:
               --extractor-args "youtubepot-bgutilscript:server_home=/opt/bgutil/server" \
               --extractor-args "youtube:player_client=mweb;formats=missing_pot;fetch_pot=always;pot_trace=true" \
               "https://www.youtube.com/watch?v=YKLXKyhUmMs" 2>&1 | tail -120'
+
+      - name: Probe YouTube through Cloudflare WARP
+        timeout-minutes: 15
+        run: |
+          set -x
+          curl -fsSL -o /tmp/warp-plus.zip \
+            https://github.com/bepass-org/warp-plus/releases/download/v1.2.6/warp-plus_linux-amd64.zip
+          mkdir -p /tmp/warp-plus && unzip -o /tmp/warp-plus.zip -d /tmp/warp-plus
+          chmod +x /tmp/warp-plus/warp-plus
+          nohup /tmp/warp-plus/warp-plus -b 127.0.0.1:8086 -v > /tmp/warp-plus.log 2>&1 &
+          sleep 12
+          tail -30 /tmp/warp-plus.log
+          curl -s --max-time 20 --socks5-hostname 127.0.0.1:8086 https://www.cloudflare.com/cdn-cgi/trace || true
+          docker run --rm --network host --entrypoint /bin/sh waqqad-transcriber:check -c \
+            'yt-dlp -v --skip-download --no-warnings --proxy socks5://127.0.0.1:8086 \
+              "https://www.youtube.com/watch?v=YKLXKyhUmMs" 2>&1 | tail -100'
