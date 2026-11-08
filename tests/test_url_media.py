@@ -295,6 +295,40 @@ class TestYoutubeCookies(unittest.TestCase):
             options = url_media._youtube_options(Path(temp), 1024, None)
             self.assertNotIn("extractor_args", options)
 
+    def test_options_request_pot_provider(self):
+        with TemporaryDirectory() as temp:
+            options = url_media._youtube_options(
+                Path(temp), 1024, None, ("web",),
+                missing_pot=True, pot=True,
+            )
+            self.assertEqual(
+                options["extractor_args"]["youtubepot-bgutilscript"][
+                    "server_home"
+                ],
+                [url_media.POT_SERVER_HOME]
+            )
+
+
+class TestPotProvider(unittest.TestCase):
+    def test_state_reports_missing_install(self):
+        with TemporaryDirectory() as temp:
+            with mock.patch.object(url_media, "POT_SERVER_HOME", temp):
+                self.assertEqual(
+                    url_media.pot_provider_state(),
+                    "غير مثبّت"
+                )
+
+    def test_state_reports_missing_node_modules(self):
+        with TemporaryDirectory() as temp:
+            src = Path(temp) / "src"
+            src.mkdir()
+            (src / "generate_once.ts").write_text("// x", encoding="utf-8")
+            with mock.patch.object(url_media, "POT_SERVER_HOME", temp):
+                self.assertIn(
+                    "node_modules",
+                    url_media.pot_provider_state()
+                )
+
     def test_player_response_failure_counts_as_block(self):
         """هذا الخطأ كان يتجاوز المحاولة البديلة سابقًا."""
         self.assertTrue(
@@ -343,12 +377,15 @@ class TestYoutubeCookies(unittest.TestCase):
 
         with TemporaryDirectory() as temp:
             with mock.patch.dict(sys.modules, {"yt_dlp": fake_module}):
-                info = url_media._download_youtube(
-                    "https://www.youtube.com/watch?v=abc",
-                    Path(temp),
-                    1000,
-                    cookies_text=cookies,
-                )
+                with mock.patch.object(
+                    url_media, "pot_provider_state", return_value="غير مثبّت"
+                ):
+                    info = url_media._download_youtube(
+                        "https://www.youtube.com/watch?v=abc",
+                        Path(temp),
+                        1000,
+                        cookies_text=cookies,
+                    )
 
         self.assertEqual(info[2], "ok")
         # أربع محاولات بالكوكيز ثم محاولة أخيرة بلا كوكيز.
@@ -363,6 +400,65 @@ class TestYoutubeCookies(unittest.TestCase):
         self.assertIn(
             "missing_pot",
             calls[1]["extractor_args"]["youtube"]["formats"]
+        )
+
+    def test_pot_attempts_run_first_when_provider_ready(self):
+        """عند توفّر المزوّد نبدأ بمحاولة تحمل توكن إثبات الأصل."""
+        import sys
+        import types
+
+        sys.modules.pop("yt_dlp", None)
+
+        calls = []
+
+        class FakeYDL:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=True):
+                calls.append(self.options)
+                home = Path(self.options["paths"]["home"])
+                (home / "lecture.mp3").write_bytes(b"audio")
+                return {"title": "ok", "formats": []}
+
+        fake_module = types.ModuleType("yt_dlp")
+        fake_module.version = types.SimpleNamespace(__version__="2026.10.26")
+        fake_module.YoutubeDL = FakeYDL
+
+        cookies = (
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n"
+        )
+
+        with TemporaryDirectory() as temp:
+            with mock.patch.dict(sys.modules, {"yt_dlp": fake_module}):
+                with mock.patch.object(
+                    url_media, "pot_provider_state", return_value="جاهز ✅"
+                ):
+                    info = url_media._download_youtube(
+                        "https://www.youtube.com/watch?v=abc",
+                        Path(temp),
+                        1000,
+                        cookies_text=cookies,
+                    )
+
+        self.assertEqual(info[2], "ok")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["extractor_args"]["youtubepot-bgutilscript"][
+                "server_home"
+            ],
+            [url_media.POT_SERVER_HOME]
+        )
+        self.assertIn(
+            "missing_pot",
+            calls[0]["extractor_args"]["youtube"]["formats"]
         )
 
 

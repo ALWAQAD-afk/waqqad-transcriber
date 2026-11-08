@@ -16,6 +16,7 @@ import ipaddress
 import mimetypes
 import os
 import re
+import shutil
 import socket
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
@@ -301,6 +302,27 @@ YOUTUBE_LAST_CLIENTS = ("tv_downgraded", "android_vr", "ios")
 # تمنح صيغًا من عنوان الخادم بعد حل التحدي الجديد (بيئة JS).
 YOUTUBE_BARE_CLIENTS = ("visionos", "android_vr", "web_safari", "ios")
 
+# مزوّد توكن إثبات الأصل (PO Token): يوتيوب يرفض منح صيغ الصوت لعملاء
+# الويب القادمين من عنوان مركز بيانات إلا بتوكن يُولَّد بتشغيل متصفح
+# وهمي على الخادم. السكربت ووحداته تأتيان من صورة bgutil في Dockerfile.
+POT_SERVER_HOME = "/opt/bgutil/server"
+POT_CLIENT_SETS = (
+    ("web_safari", "web", "mweb"),
+    ("tv",),
+)
+
+
+def pot_provider_state():
+    """هل مزوّد PO Token مثبّت وجاهز على هذا الخادم؟"""
+    server = Path(POT_SERVER_HOME)
+    if not (server / "src" / "generate_once.ts").is_file():
+        return "غير مثبّت"
+    if not (server / "node_modules").is_dir():
+        return "ناقص (node_modules)"
+    if not shutil.which("deno"):
+        return "غير مثبّت (لا Deno)"
+    return "جاهز ✅"
+
 
 def _short_reason(error):
     """سطر قصير من خطأ yt-dlp يصلح للسجلّات."""
@@ -436,6 +458,7 @@ def _youtube_options(
     cookies_file=None,
     clients=None,
     missing_pot=False,
+    pot=False,
 ):
     options = {
         "format": "bestaudio/best",
@@ -469,6 +492,15 @@ def _youtube_options(
         youtube_args["formats"] = ["missing_pot"]
     if youtube_args:
         options["extractor_args"] = {"youtube": youtube_args}
+    if pot:
+        # يطلب من إضافة bgutil توليد التوكن عبر سكربت Deno الجاهز.
+        options.setdefault("extractor_args", {})
+        options["extractor_args"]["youtubepot-bgutilscript"] = {
+            "server_home": [POT_SERVER_HOME]
+        }
+        deno_path = shutil.which("deno")
+        if deno_path:
+            options["js_runtimes"] = {"deno": {"path": deno_path}}
     # مخرج اختياري إن حجب يوتيوب عنوان الخادم نهائيًا.
     proxy = os.environ.get("YTDLP_PROXY", "").strip()
     if proxy:
@@ -581,7 +613,8 @@ def youtube_cookie_status(cookies_text, timeout=20):
     return "تعذّر تحديد حالة الحساب (يوتيوب لم يفصح عنها)"
 
 
-def inspect_youtube(url, destination_dir, cookies_text=None, clients=None):
+def inspect_youtube(url, destination_dir, cookies_text=None, clients=None,
+                    pot=False):
     """فحص للمطوّر: ما الصيغ التي يقدمها يوتيوب من هذا الخادم فعلًا؟
 
     ``clients=None`` يستخدم العملاء الافتراضيين، وإلا تُفرض القائمة.
@@ -599,6 +632,7 @@ def inspect_youtube(url, destination_dir, cookies_text=None, clients=None):
         cookies_file,
         clients,
         missing_pot=True,
+        pot=pot,
     )
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -627,22 +661,29 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
     info = None
     last_message = ""
 
-    # نحاول الوضع الطبيعي أولًا (لا نكسر ما يعمل)، ثم بإدراج صيغ
-    # «missing PO Token»، ثم عملاء بدلاء، وأخيرًا بلا كوكيز.
-    attempts = [
-        (None, False, cookies_file),
-        (None, True, cookies_file),
-        (YOUTUBE_ALT_CLIENTS, True, cookies_file),
-        (YOUTUBE_LAST_CLIENTS, True, cookies_file),
-    ]
+    # أولًا: عملاء الويب مع توكن إثبات الأصل (إن كان المزوّد جاهزًا)،
+    # لأنهم وحدهم يمنحون صيغ الصوت من عنوان الخادم. ثم السلسلة السابقة
+    # كاملة كاحتياط حتى لا نكسر أي حالة كانت تعمل.
+    attempts = []
+    if pot_provider_state() == "جاهز ✅":
+        for client_set in POT_CLIENT_SETS:
+            attempts.append((client_set, True, cookies_file, True))
+    attempts.extend([
+        (None, False, cookies_file, False),
+        (None, True, cookies_file, False),
+        (YOUTUBE_ALT_CLIENTS, True, cookies_file, False),
+        (YOUTUBE_LAST_CLIENTS, True, cookies_file, False),
+    ])
     if cookies_text:
-        attempts.append((YOUTUBE_BARE_CLIENTS, True, None))
+        attempts.append((YOUTUBE_BARE_CLIENTS, True, None, False))
 
     try:
-        for clients, allow_missing_pot, use_cookies in attempts:
+        for clients, allow_missing_pot, use_cookies, use_pot in attempts:
             label = "+".join(clients) if clients else "default"
             if allow_missing_pot:
                 label += " +missing_pot"
+            if use_pot:
+                label += " +PO"
             if use_cookies is None:
                 label += " (بدون كوكيز)"
             options = _youtube_options(
@@ -651,6 +692,7 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
                 use_cookies,
                 clients,
                 missing_pot=allow_missing_pot,
+                pot=use_pot,
             )
             try:
                 with yt_dlp.YoutubeDL(options) as ydl:

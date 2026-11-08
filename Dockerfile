@@ -1,17 +1,20 @@
+# مزوّد توكن إثبات الأصل (PO Token) ليوتيوب: صورة رسمية جاهزة تحوي
+# Deno + وحدات npm المطلوبة. ننسخ منها وقت البناء بدل بناء canvas محليًا
+# (بناء ثقيل ويحتاج مكتبات نظام كثيرة). هذا ما يمنح يوتيوب صيغ الصوت
+# من عنوان الخادم بدل صيغ «القصص» فقط.
+FROM brainicism/bgutil-ytdlp-pot-provider:2.0.2-deno AS bgutil
+
 FROM python:3.12-slim-bookworm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg unzip curl ca-certificates \
+        libcairo2 libpango-1.0-0 libjpeg62-turbo libgif7 librsvg2-2 libpixman-1-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# بيئة JS (Deno) يطلبها yt-dlp الحديث لتفريغ يوتيوب. تركيب «بأفضل جهد»:
-# المصدر الأول إصدار GitHub الأحدث؛ ثم سكربت deno.land الرسمي.
-# إن فشلا معًا يبقى البناء ناجحًا لكن يوتيوب قد تعطي صيغًا ناقصة.
-RUN (python -c "import urllib.request, zipfile, io; data = urllib.request.urlopen('https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip', timeout=120).read(); zipfile.ZipFile(io.BytesIO(data)).extract('deno', '/usr/local/bin')" \
-        && chmod +x /usr/local/bin/deno) \
-    || (curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y --no-modify-path) \
-    || echo "WARN: deno install failed — YouTube may return no-audio formats" \
-    && deno --version || echo "[WARN] deno NOT available at build end"
+# Deno من صورة المزوّد: نسخة مضمونة التوافق (2.9.5) وتصلح أيضًا
+# كبيئة JS التي يطلبها yt-dlp الحديث.
+COPY --from=bgutil /usr/bin/deno /usr/local/bin/deno
+RUN chmod +x /usr/local/bin/deno && deno --version
 
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --create-home app
@@ -21,6 +24,15 @@ WORKDIR /app
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
+
+# سكربت التوليد ووحداته الجاهزة.
+# يعمل بالوضع «script»: يستدعيه yt-dlp عند الحاجة فقط.
+COPY --from=bgutil /app/src /opt/bgutil/server/src
+COPY --from=bgutil /app/node_modules /opt/bgutil/server/node_modules
+COPY --from=bgutil /app/package.json /opt/bgutil/server/package.json
+COPY --from=bgutil /app/deno.json /opt/bgutil/server/deno.json
+RUN mkdir -p /home/app/.cache \
+    && chown -R app:app /opt/bgutil /home/app/.cache
 
 COPY --chown=app:app . .
 

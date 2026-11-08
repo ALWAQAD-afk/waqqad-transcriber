@@ -5,3 +5,4 @@ flask-cors==6.0.5
 psycopg[binary]==3.3.6
 psycopg-pool==3.3.3
 yt-dlp==2026.10.26
+bgutil-ytdlp-pot-provider==2.0.2
