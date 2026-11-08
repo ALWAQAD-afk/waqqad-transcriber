@@ -50,19 +50,10 @@ jobs:
         timeout-minutes: 15
         run: |
           docker run --rm --entrypoint /bin/sh waqqad-transcriber:check -c \
-            'python - <<"PY"
-import tempfile
-from pathlib import Path
-import url_media
-
-url = "https://www.youtube.com/watch?v=YKLXKyhUmMs"
-with tempfile.TemporaryDirectory() as temp:
-    for clients in (("mweb",), ("web",), ("web_safari",)):
-        label = "+".join(clients)
-        info, error = url_media.inspect_youtube(
-            url, Path(temp), clients=clients, pot=True, force_pot=True
-        )
-        print("===", label, "error:", error)
-        for fmt in (info or {}).get("formats") or []:
-            print(fmt.get("format_id"), fmt.get("ext"), fmt.get("acodec"), fmt.get("vcodec"), fmt.get("protocol"))
-PY'
+            'for client in mweb web web_safari; do
+               echo "=== $client"
+               yt-dlp -F --no-warnings \
+                 --extractor-args "youtubepot-bgutilscript:server_home=/opt/bgutil/server" \
+                 --extractor-args "youtube:player_client=$client;formats=missing_pot;fetch_pot=always;pot_trace=true;player_skip=webpage" \
+                 "https://www.youtube.com/watch?v=YKLXKyhUmMs" 2>&1 | tail -40
+             done'
