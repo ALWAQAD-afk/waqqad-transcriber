@@ -18,7 +18,21 @@ jobs:
         with:
           context: .
           push: false
-          load: false
+          load: true
           tags: waqqad-transcriber:check
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Check PO token provider is installed
+        run: |
+          docker run --rm --entrypoint /bin/sh waqqad-transcriber:check -c \
+            'deno --version && python -c "import url_media; print(url_media.pot_provider_state())"'
+
+      - name: Probe YouTube with PO token
+        timeout-minutes: 10
+        run: |
+          docker run --rm --entrypoint /bin/sh waqqad-transcriber:check -c \
+            'yt-dlp -v --skip-download --no-warnings \
+              --extractor-args "youtubepot-bgutilscript:server_home=/opt/bgutil/server" \
+              --extractor-args "youtube:player_client=web;formats=missing_pot" \
+              "https://www.youtube.com/watch?v=YKLXKyhUmMs" 2>&1 | tail -80'
