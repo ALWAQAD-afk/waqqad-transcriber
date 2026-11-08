@@ -2885,6 +2885,11 @@ def handle_ytinfo_command(chat_id, user_id, argument):
                 if cookies_text
                 else "لا توجد كوكيز محفوظة"
             )
+            cookie_keys = (
+                url_media.cookie_names_state(cookies_text)
+                if cookies_text
+                else "لا توجد كوكيز محفوظة"
+            )
             pot_state = url_media.pot_provider_state()
 
             probes = [
@@ -2918,6 +2923,7 @@ def handle_ytinfo_command(chat_id, user_id, argument):
                     cookies_text=cookies_text,
                     clients=clients,
                     pot=use_pot,
+                    force_pot=use_pot,
                 )
                 if error:
                     results.append((f"🍪 {label}", f"خطأ: {error}"))
@@ -2978,6 +2984,7 @@ def handle_ytinfo_command(chat_id, user_id, argument):
                 f"🧾 نسخة: {url_media._yt_version()}"
                 f" — 🖥️ بيئة JS: {runtime}\n"
                 f"🍪 حالة الحساب: {cookie_state}\n"
+                f"🔑 {cookie_keys}\n"
                 f"🔑 مزوّد إثبات الأصل: {pot_state}\n"
                 f"🍪 الافتراضيات مع الكوكيز — 🚫 آخر سطر بدونها\n"
                 "------------------------------"
@@ -3056,6 +3063,8 @@ def handle_cookies_command(chat_id, user_id, argument):
     except url_media.UrlError:
         count = 0
 
+    keys_state = url_media.cookie_names_state(row.get("value") or "")
+
     updated = row.get("updated_at")
     when = (
         updated.strftime("%Y-%m-%d %H:%M")
@@ -3066,6 +3075,7 @@ def handle_cookies_command(chat_id, user_id, argument):
     telegram_send_message(
         chat_id,
         f"✅ كوكيز يوتيوب محفوظة ({count} سطرًا).\n"
+        f"🔑 {keys_state}\n"
         f"🕓 آخر تحديث: {when}\n\n"
         "للتحديث: أرسل ملف cookies.txt جديدًا.\n"
         "للحذف: /cookies clear"
