@@ -30,7 +30,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY --from=bgutil /app/src /opt/bgutil/server/src
 COPY --from=bgutil /app/node_modules /opt/bgutil/server/node_modules
 COPY --from=bgutil /app/package.json /opt/bgutil/server/package.json
-COPY --from=bgutil /app/deno.json /opt/bgutil/server/deno.json
 RUN mkdir -p /home/app/.cache \
     && chown -R app:app /opt/bgutil /home/app/.cache
 
