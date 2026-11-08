@@ -307,8 +307,24 @@ YOUTUBE_BARE_CLIENTS = ("visionos", "android_vr", "web_safari", "ios")
 # وهمي على الخادم. السكربت ووحداته تأتيان من صورة bgutil في Dockerfile.
 POT_SERVER_HOME = "/opt/bgutil/server"
 POT_CLIENT_SETS = (
-    ("web_safari", "web", "mweb"),
+    ("mweb",),
+    ("web_safari", "web"),
     ("tv",),
+)
+
+# مفاتيح الكوكيز التي تدل على جلسة حساب يوتيوب كاملة. غياب بعضها يعني
+# غالبًا أن الملف صُدِّر تصديرًا ناقصًا، لا أن الحساب نفسه معطوب.
+COOKIE_KEY_NAMES = (
+    "SID",
+    "HSID",
+    "SSID",
+    "APISID",
+    "SAPISID",
+    "__Secure-1PSID",
+    "__Secure-3PSID",
+    "__Secure-1PAPISID",
+    "__Secure-3PAPISID",
+    "LOGIN_INFO",
 )
 
 
@@ -459,6 +475,7 @@ def _youtube_options(
     clients=None,
     missing_pot=False,
     pot=False,
+    force_pot=False,
 ):
     options = {
         "format": "bestaudio/best",
@@ -490,6 +507,15 @@ def _youtube_options(
         youtube_args["player_client"] = list(clients)
     if missing_pot:
         youtube_args["formats"] = ["missing_pot"]
+    if pot and force_pot:
+        # السياسة الافتراضية auto لا تطلب توكن المشغّل إلا إذا اعتبره
+        # يوتيوب «إلزاميًا»، وهذا لا يحدث مع web/mweb. always تفرض
+        # التوليد، وpot_trace يُظهر في السجل ما جرى فعلًا. وplayer_skip
+        # يمنع إعادة استخدام استجابة الصفحة المخفّضة (قصص فقط) بدل
+        # طلب مشغّل حقيقي بالتوكن.
+        youtube_args["fetch_pot"] = ["always"]
+        youtube_args["pot_trace"] = ["true"]
+        youtube_args["player_skip"] = ["webpage"]
     if youtube_args:
         options["extractor_args"] = {"youtube": youtube_args}
     if pot:
@@ -613,8 +639,40 @@ def youtube_cookie_status(cookies_text, timeout=20):
     return "تعذّر تحديد حالة الحساب (يوتيوب لم يفصح عنها)"
 
 
+def cookie_names_state(cookies_text):
+    """ملخّص عربي لمفاتيح الكوكيز الموجودة، دون كشف أي قيمة."""
+    cookies = _parse_netscape_cookies(cookies_text)
+    if not cookies:
+        return "لا توجد كوكيز صالحة الشكل"
+    present = [name for name in COOKIE_KEY_NAMES if cookies.get(name)]
+    missing = [name for name in COOKIE_KEY_NAMES if not cookies.get(name)]
+    if not missing:
+        return f"مفاتيح الكوكيز: {len(present)}/{len(COOKIE_KEY_NAMES)} كاملة ✅"
+    return (
+        f"مفاتيح الكوكيز: {len(present)}/{len(COOKIE_KEY_NAMES)}"
+        f" — ناقص: {', '.join(missing)}"
+    )
+
+
+def _log_formats(label, info):
+    """يسجّل الصيغ الفعلية في سجل الخادم لتشخيص حجب يوتيوب."""
+    formats = (info or {}).get("formats") or []
+    print(f"[YTDLP] {label}: {len(formats)} formats", flush=True)
+    for fmt in formats:
+        if not isinstance(fmt, dict):
+            continue
+        print(
+            "[YTDLP]   "
+            f"id={fmt.get('format_id')} ext={fmt.get('ext')} "
+            f"acodec={fmt.get('acodec')} vcodec={fmt.get('vcodec')} "
+            f"proto={fmt.get('protocol')} "
+            f"tbr={fmt.get('tbr')}",
+            flush=True
+        )
+
+
 def inspect_youtube(url, destination_dir, cookies_text=None, clients=None,
-                    pot=False):
+                    pot=False, force_pot=False):
     """فحص للمطوّر: ما الصيغ التي يقدمها يوتيوب من هذا الخادم فعلًا؟
 
     ``clients=None`` يستخدم العملاء الافتراضيين، وإلا تُفرض القائمة.
@@ -633,12 +691,24 @@ def inspect_youtube(url, destination_dir, cookies_text=None, clients=None,
         clients,
         missing_pot=True,
         pot=pot,
+        force_pot=force_pot,
     )
+    label = "+".join(clients) if clients else "default"
+    if force_pot:
+        label += " +PO forced"
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             # process=False: قائمة الصيغ قبل تطبيق المحدد bestaudio/best.
-            return ydl.extract_info(url, download=False, process=False), ""
+            info = ydl.extract_info(url, download=False, process=False)
+        if pot:
+            _log_formats(label, info)
+        return info, ""
     except Exception as e:
+        if pot:
+            print(
+                f"[YTDLP] {label} failed: {_short_reason(e)}",
+                flush=True
+            )
         return None, _short_reason(e)
     finally:
         if temporary_cookies and cookies_file:
@@ -667,23 +737,33 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
     attempts = []
     if pot_provider_state() == "جاهز ✅":
         for client_set in POT_CLIENT_SETS:
-            attempts.append((client_set, True, cookies_file, True))
+            # force_pot: سياسة auto لا تطلب توكن المشغّل مع web/mweb،
+            # فنفرض التوليد في محاولات المزوّد تحديدًا.
+            attempts.append((client_set, True, cookies_file, True, True))
     attempts.extend([
-        (None, False, cookies_file, False),
-        (None, True, cookies_file, False),
-        (YOUTUBE_ALT_CLIENTS, True, cookies_file, False),
-        (YOUTUBE_LAST_CLIENTS, True, cookies_file, False),
+        (None, False, cookies_file, False, False),
+        (None, True, cookies_file, False, False),
+        (YOUTUBE_ALT_CLIENTS, True, cookies_file, False, False),
+        (YOUTUBE_LAST_CLIENTS, True, cookies_file, False, False),
     ])
     if cookies_text:
-        attempts.append((YOUTUBE_BARE_CLIENTS, True, None, False))
+        attempts.append((YOUTUBE_BARE_CLIENTS, True, None, False, False))
 
     try:
-        for clients, allow_missing_pot, use_cookies, use_pot in attempts:
+        for (
+            clients,
+            allow_missing_pot,
+            use_cookies,
+            use_pot,
+            force_pot,
+        ) in attempts:
             label = "+".join(clients) if clients else "default"
             if allow_missing_pot:
                 label += " +missing_pot"
             if use_pot:
                 label += " +PO"
+            if force_pot:
+                label += " (forced)"
             if use_cookies is None:
                 label += " (بدون كوكيز)"
             options = _youtube_options(
@@ -693,6 +773,7 @@ def _download_youtube(url, destination_dir, max_bytes, cookies_text=None):
                 clients,
                 missing_pot=allow_missing_pot,
                 pot=use_pot,
+                force_pot=force_pot,
             )
             try:
                 with yt_dlp.YoutubeDL(options) as ydl:

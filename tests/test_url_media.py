@@ -308,6 +308,27 @@ class TestYoutubeCookies(unittest.TestCase):
                 [url_media.POT_SERVER_HOME]
             )
 
+    def test_forced_pot_uses_always_and_skips_webpage(self):
+        with TemporaryDirectory() as temp:
+            options = url_media._youtube_options(
+                Path(temp), 1024, None, ("mweb",),
+                missing_pot=True, pot=True, force_pot=True,
+            )
+            youtube = options["extractor_args"]["youtube"]
+            self.assertEqual(youtube["fetch_pot"], ["always"])
+            self.assertEqual(youtube["pot_trace"], ["true"])
+            self.assertEqual(youtube["player_skip"], ["webpage"])
+
+    def test_non_forced_pot_leaves_policy_auto(self):
+        with TemporaryDirectory() as temp:
+            options = url_media._youtube_options(
+                Path(temp), 1024, None, ("web",),
+                missing_pot=True, pot=True,
+            )
+            youtube = options["extractor_args"]["youtube"]
+            self.assertNotIn("fetch_pot", youtube)
+            self.assertNotIn("player_skip", youtube)
+
 
 class TestPotProvider(unittest.TestCase):
     def test_state_reports_missing_install(self):
@@ -503,6 +524,28 @@ class TestCookieStatus(unittest.TestCase):
             "لا توجد كوكيز",
             url_media.youtube_cookie_status("")
         )
+
+    def test_cookie_names_state_lists_missing_keys(self):
+        text = (
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tone\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t0\tHSID\ttwo\n"
+        )
+        state = url_media.cookie_names_state(text)
+        self.assertIn("2/10", state)
+        self.assertIn("__Secure-1PSID", state)
+
+    def test_cookie_names_state_reports_complete(self):
+        lines = ["# Netscape HTTP Cookie File"]
+        for name in url_media.COOKIE_KEY_NAMES:
+            lines.append(f".youtube.com\tTRUE\t/\tTRUE\t0\t{name}\tv")
+        state = url_media.cookie_names_state("\n".join(lines))
+        self.assertIn("10/10", state)
+        self.assertIn("كاملة", state)
+
+    def test_cookie_names_state_never_leaks_values(self):
+        text = ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsecret-value\n"
+        self.assertNotIn("secret-value", url_media.cookie_names_state(text))
 
 
 class TestDisplayName(unittest.TestCase):
