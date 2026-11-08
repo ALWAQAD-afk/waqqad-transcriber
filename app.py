@@ -2885,30 +2885,39 @@ def handle_ytinfo_command(chat_id, user_id, argument):
                 if cookies_text
                 else "لا توجد كوكيز محفوظة"
             )
+            pot_state = url_media.pot_provider_state()
 
             probes = [
-                ("الافتراضي", None),
-                ("visionos", ("visionos",)),
-                ("web_safari", ("web_safari",)),
-                ("tv", ("tv",)),
-                ("tv_samsung", ("tv_samsung",)),
-                ("tv_simply", ("tv_simply",)),
-                ("tv_downgraded", ("tv_downgraded",)),
-                ("web", ("web",)),
-                ("web_creator", ("web_creator",)),
-                ("mweb", ("mweb",)),
-                ("android_vr", ("android_vr",)),
-                ("android", ("android",)),
-                ("ios", ("ios",)),
+                ("الافتراضي", None, False),
+                ("visionos", ("visionos",), False),
+                ("web_safari", ("web_safari",), False),
+                ("tv", ("tv",), False),
+                ("tv_samsung", ("tv_samsung",), False),
+                ("tv_simply", ("tv_simply",), False),
+                ("tv_downgraded", ("tv_downgraded",), False),
+                ("web", ("web",), False),
+                ("web_creator", ("web_creator",), False),
+                ("mweb", ("mweb",), False),
+                ("android_vr", ("android_vr",), False),
+                ("android", ("android",), False),
+                ("ios", ("ios",), False),
             ]
+            if pot_state == "جاهز ✅":
+                probes.extend([
+                    ("web +PO", ("web",), True),
+                    ("web_safari +PO", ("web_safari",), True),
+                    ("mweb +PO", ("mweb",), True),
+                    ("tv +PO", ("tv",), True),
+                ])
             results = []
             first_title = None
-            for label, clients in probes:
+            for label, clients, use_pot in probes:
                 info, error = url_media.inspect_youtube(
                     url,
                     work_dir,
                     cookies_text=cookies_text,
                     clients=clients,
+                    pot=use_pot,
                 )
                 if error:
                     results.append((f"🍪 {label}", f"خطأ: {error}"))
@@ -2969,6 +2978,7 @@ def handle_ytinfo_command(chat_id, user_id, argument):
                 f"🧾 نسخة: {url_media._yt_version()}"
                 f" — 🖥️ بيئة JS: {runtime}\n"
                 f"🍪 حالة الحساب: {cookie_state}\n"
+                f"🔑 مزوّد إثبات الأصل: {pot_state}\n"
                 f"🍪 الافتراضيات مع الكوكيز — 🚫 آخر سطر بدونها\n"
                 "------------------------------"
             )
