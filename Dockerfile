@@ -13,7 +13,11 @@ RUN apt-get update \
 
 # Deno من صورة المزوّد: نسخة مضمونة التوافق (2.9.5) وتصلح أيضًا
 # كبيئة JS التي يطلبها yt-dlp الحديث.
+# ننسخ أيضًا ذاكرة deno المؤقتة من الصورة: بدونها يُشغَّل سكربت
+# المزوّد باردًا فيتجاوز مهلة الفحص (15 ثانية) ويُعدّ غير متاح رغم سلامته.
 COPY --from=bgutil /usr/bin/deno /usr/local/bin/deno
+COPY --from=bgutil /app/.cache /opt/bgutil/server/.cache
+ENV DENO_DIR=/opt/bgutil/server/.cache/deno
 RUN chmod +x /usr/local/bin/deno && deno --version
 
 RUN groupadd --gid 10001 app \
@@ -30,6 +34,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY --from=bgutil /app/src /opt/bgutil/server/src
 COPY --from=bgutil /app/node_modules /opt/bgutil/server/node_modules
 COPY --from=bgutil /app/package.json /opt/bgutil/server/package.json
+COPY --from=bgutil /app/deno.lock /opt/bgutil/server/deno.lock
+COPY --from=bgutil /app/tsconfig.json /opt/bgutil/server/tsconfig.json
+COPY --from=bgutil /app/types /opt/bgutil/server/types
+# تخزين مسبق لأصناف generate_once.ts فوق ذاكرة الصورة الجاهزة.
+# best-effort: لو تعذّر الوصول للشبكة وقت البناء تبقى الذاكرة المنسوخة.
+RUN cd /opt/bgutil/server \
+    && deno cache --no-check src/generate_once.ts || true
 RUN mkdir -p /home/app/.cache \
     && chown -R app:app /opt/bgutil /home/app/.cache
 
