@@ -4,5 +4,9 @@ requests==2.34.2
 flask-cors==6.0.5
 psycopg[binary]==3.3.6
 psycopg-pool==3.3.3
+# حزمة yt-dlp على PyPI بلا اعتماديات إلزامية: yt-dlp-ejs ليست
+# تُثبَّت تلقائيًا، ومن دونها لا يعمل حل تحدّي JavaScript (n/sig)
+# حتى لو كانت Deno مثبّتة، فتضيع صيغ الصوت من عملاء الويب.
 yt-dlp==2026.10.26
+yt-dlp-ejs==0.8.0
 bgutil-ytdlp-pot-provider==2.0.2

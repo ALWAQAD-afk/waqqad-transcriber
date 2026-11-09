@@ -2875,6 +2875,7 @@ def handle_ytinfo_command(chat_id, user_id, argument):
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
             runtime = url_media.js_runtime_state()
+            ejs_state = url_media.ejs_solver_state()
             try:
                 cookies_text = get_setting(YOUTUBE_COOKIES_KEY)
             except Exception as e:
@@ -2890,24 +2891,23 @@ def handle_ytinfo_command(chat_id, user_id, argument):
                 if cookies_text
                 else "لا توجد كوكيز محفوظة"
             )
+            cookie_auth = (
+                url_media.cookies_auth_state(cookies_text)
+                if cookies_text
+                else "لا توجد كوكيز محفوظة"
+            )
             pot_state = url_media.pot_provider_state()
+            pot_ready = pot_state.startswith("جاهز")
 
-            probes = [
-                ("الافتراضي", None, False),
-                ("visionos", ("visionos",), False),
-                ("web_safari", ("web_safari",), False),
-                ("tv", ("tv",), False),
-                ("tv_samsung", ("tv_samsung",), False),
-                ("tv_simply", ("tv_simply",), False),
-                ("tv_downgraded", ("tv_downgraded",), False),
-                ("web", ("web",), False),
-                ("web_creator", ("web_creator",), False),
-                ("mweb", ("mweb",), False),
-                ("android_vr", ("android_vr",), False),
-                ("android", ("android",), False),
-                ("ios", ("ios",), False),
-            ]
-            if pot_state == "جاهز ✅":
+            probes = [("الافتراضي", None, False)]
+            for name in (
+                "visionos", "web_safari", "tv", "tv_samsung", "tv_simply",
+                "tv_downgraded", "web", "web_creator", "web_embedded",
+                "mweb", "android_vr", "android", "ios",
+            ):
+                if url_media._youtube_clients((name,)):
+                    probes.append((name, (name,), False))
+            if pot_ready:
                 probes.extend([
                     ("web +PO", ("web",), True),
                     ("web_safari +PO", ("web_safari",), True),
@@ -2924,26 +2924,29 @@ def handle_ytinfo_command(chat_id, user_id, argument):
                     clients=clients,
                     pot=use_pot,
                     force_pot=use_pot,
+                    include_missing_pot=True,
                 )
                 if error:
                     results.append((f"🍪 {label}", f"خطأ: {error}"))
                     continue
                 if first_title is None:
                     first_title = str((info or {}).get("title") or "").strip()
-                formats = (info or {}).get("formats") or []
-                audible = [
-                    f for f in formats
-                    if f.get("acodec") not in (None, "none")
-                ]
-                results.append(
-                    (
-                        f"🍪 {label}",
-                        f"{len(formats)} صيغة — صوت: {len(audible)}"
-                    )
+                summary = url_media.youtube_formats_summary(info)
+                status = (
+                    f"{summary['total']} صيغة — صوت صالح: "
+                    f"{summary['audio']}"
                 )
-                if audible:
+                if summary["missing_pot"]:
+                    status += f" — بلا PO: {summary['missing_pot']}"
+                if summary["drm"]:
+                    status += f" — DRM: {summary['drm']}"
+                if not summary["audio"]:
+                    label = f"{label} ❌ بلا صوت"
+                results.append((f"🍪 {label}", status))
+                if summary["audio"]:
                     ids = ", ".join(
-                        str(f.get("format_id")) for f in audible[:5]
+                        str(f.get("format_id"))
+                        for f in summary["formats"][:5]
                     )
                     results.append((f"🍪 {label} — صيغ الصوت", ids))
 
@@ -2953,26 +2956,27 @@ def handle_ytinfo_command(chat_id, user_id, argument):
                     work_dir,
                     cookies_text=None,
                     clients=None,
+                    include_missing_pot=True,
                 )
                 if error:
                     results.append(
                         ("🚫 بدون كوكيز — الافتراضي", f"خطأ: {error}")
                     )
                 else:
-                    formats = (info or {}).get("formats") or []
-                    audible = [
-                        f for f in formats
-                        if f.get("acodec") not in (None, "none")
-                    ]
-                    results.append(
-                        (
-                            "🚫 بدون كوكيز — الافتراضي",
-                            f"{len(formats)} صيغة — صوت: {len(audible)}"
-                        )
+                    summary = url_media.youtube_formats_summary(info)
+                    status = (
+                        f"{summary['total']} صيغة — صوت صالح: "
+                        f"{summary['audio']}"
                     )
-                    if audible:
+                    if summary["missing_pot"]:
+                        status += f" — بلا PO: {summary['missing_pot']}"
+                    results.append(
+                        ("🚫 بدون كوكيز — الافتراضي", status)
+                    )
+                    if summary["audio"]:
                         ids = ", ".join(
-                            str(f.get("format_id")) for f in audible[:5]
+                            str(f.get("format_id"))
+                            for f in summary["formats"][:5]
                         )
                         results.append(
                             ("🚫 بدون كوكيز — صيغ الصوت", ids)
@@ -2983,10 +2987,12 @@ def handle_ytinfo_command(chat_id, user_id, argument):
                 f"ℹ️ سبر: {url}{title_part}\n"
                 f"🧾 نسخة: {url_media._yt_version()}"
                 f" — 🖥️ بيئة JS: {runtime}\n"
+                f"🧩 حزمة EJS: {ejs_state}\n"
                 f"🍪 حالة الحساب: {cookie_state}\n"
                 f"🔑 {cookie_keys}\n"
+                f"🔐 {cookie_auth}\n"
                 f"🔑 مزوّد إثبات الأصل: {pot_state}\n"
-                f"🍪 الافتراضيات مع الكوكيز — 🚫 آخر سطر بدونها\n"
+                "ℹ️ «صوت صالح» يستبعد القصص وDRM وصيغ MISSING POT\n"
                 "------------------------------"
             )
             lines = [header]
@@ -3064,6 +3070,7 @@ def handle_cookies_command(chat_id, user_id, argument):
         count = 0
 
     keys_state = url_media.cookie_names_state(row.get("value") or "")
+    auth_state = url_media.cookies_auth_state(row.get("value") or "")
 
     updated = row.get("updated_at")
     when = (
@@ -3076,6 +3083,7 @@ def handle_cookies_command(chat_id, user_id, argument):
         chat_id,
         f"✅ كوكيز يوتيوب محفوظة ({count} سطرًا).\n"
         f"🔑 {keys_state}\n"
+        f"🔐 {auth_state}\n"
         f"🕓 آخر تحديث: {when}\n\n"
         "للتحديث: أرسل ملف cookies.txt جديدًا.\n"
         "للحذف: /cookies clear"
