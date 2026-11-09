@@ -331,11 +331,14 @@ class TestYoutubeCookies(unittest.TestCase):
 
 
 class TestPotProvider(unittest.TestCase):
+    def setUp(self):
+        url_media._POT_STATE_CACHE.update({"checked_at": 0.0, "value": None})
+
     def test_state_reports_missing_install(self):
         with TemporaryDirectory() as temp:
             with mock.patch.object(url_media, "POT_SERVER_HOME", temp):
                 self.assertEqual(
-                    url_media.pot_provider_state(),
+                    url_media.pot_provider_state(force=True),
                     "غير مثبّت"
                 )
 
@@ -347,8 +350,16 @@ class TestPotProvider(unittest.TestCase):
             with mock.patch.object(url_media, "POT_SERVER_HOME", temp):
                 self.assertIn(
                     "node_modules",
-                    url_media.pot_provider_state()
+                    url_media.pot_provider_state(force=True)
                 )
+
+    def test_state_failure_is_cached(self):
+        """الفحص البطيء لا يُعاد قبل انتهاء مدة التخزين المؤقت."""
+        with TemporaryDirectory() as temp:
+            with mock.patch.object(url_media, "POT_SERVER_HOME", temp):
+                first = url_media.pot_provider_state(force=True)
+                second = url_media.pot_provider_state()
+        self.assertEqual(first, second)
 
     def test_player_response_failure_counts_as_block(self):
         """هذا الخطأ كان يتجاوز المحاولة البديلة سابقًا."""
@@ -358,13 +369,13 @@ class TestPotProvider(unittest.TestCase):
             )
         )
 
-    def test_bare_attempt_runs_without_cookies_before_giving_up(self):
-        """إن فشلت كل محاولات الكوكيز تُجرَّب محاولة أخيرة بلا كوكيز."""
+    @staticmethod
+    def _install_fake_ytdlp(extract_info):
+        """يزرع وحدة yt_dlp وهمية ويعيد قائمة الخيارات المستخدمة."""
         import sys
         import types
 
         sys.modules.pop("yt_dlp", None)
-
         calls = []
 
         class FakeYDL:
@@ -379,107 +390,212 @@ class TestPotProvider(unittest.TestCase):
 
             def extract_info(self, url, download=True):
                 calls.append(self.options)
-                if self.options.get("cookiefile"):
-                    raise RuntimeError(
-                        "[youtube] abc: Sign in to confirm you're not a bot"
-                    )
-                home = Path(self.options["paths"]["home"])
-                (home / "lecture.mp3").write_bytes(b"audio")
-                return {"title": "ok", "formats": []}
+                return extract_info(self.options, calls)
 
         fake_module = types.ModuleType("yt_dlp")
         fake_module.version = types.SimpleNamespace(__version__="2026.10.26")
         fake_module.YoutubeDL = FakeYDL
+        return fake_module, calls
 
+    def test_plan_always_contains_bare_attempt(self):
+        """حتى لو جاءت الكوكيز من متغيّر بيئة تبقى محاولة بلا كوكيز."""
+        cookies = Path("/tmp/cookies.txt")
+        plan = url_media._youtube_attempt_plan(
+            cookies, cookies_auth=False, pot_ready=False
+        )
+        self.assertTrue(any(use_cookies is None for _, use_cookies, _, _ in plan))
+        self.assertTrue(any(use_cookies for _, use_cookies, _, _ in plan))
+        # لا محاولة مكرّرة.
+        keys = [
+            (
+                tuple(clients) if clients else None,
+                bool(use_cookies),
+                bool(use_pot),
+                bool(force_pot),
+            )
+            for clients, use_cookies, use_pot, force_pot in plan
+        ]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_plan_puts_pot_after_js_free_clients(self):
+        plan = url_media._youtube_attempt_plan(
+            Path("/tmp/cookies.txt"), cookies_auth=True, pot_ready=True
+        )
+        pot_positions = [
+            index for index, item in enumerate(plan) if item[2]
+        ]
+        bare_positions = [
+            index for index, item in enumerate(plan) if item[1] is None
+        ]
+        self.assertTrue(pot_positions)
+        self.assertLess(min(bare_positions), min(pot_positions))
+
+    def test_download_retries_until_audio_is_selected(self):
+        """نجاح استخراج البيانات دون صوت لا يُعدّ نجاحًا."""
         cookies = (
             "# Netscape HTTP Cookie File\n"
             ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n"
         )
 
+        def extract_info(options, calls):
+            home = Path(options["paths"]["home"])
+            if len(calls) == 1:
+                (home / "lecture.mp3").write_bytes(b"no audio")
+                return {"title": "ok", "formats": [], "acodec": "none"}
+            (home / "final.mp3").write_bytes(b"audio")
+            return {"title": "ok", "formats": [], "acodec": "opus"}
+
+        fake_module, calls = self._install_fake_ytdlp(extract_info)
+
         with TemporaryDirectory() as temp:
-            with mock.patch.dict(sys.modules, {"yt_dlp": fake_module}):
+            with mock.patch.dict("sys.modules", {"yt_dlp": fake_module}):
                 with mock.patch.object(
                     url_media, "pot_provider_state", return_value="غير مثبّت"
                 ):
-                    info = url_media._download_youtube(
-                        "https://www.youtube.com/watch?v=abc",
-                        Path(temp),
-                        1000,
-                        cookies_text=cookies,
-                    )
+                    with mock.patch.object(
+                        url_media, "_file_has_audio", return_value=True
+                    ):
+                        _, size, _ = url_media._download_youtube(
+                            "https://www.youtube.com/watch?v=abc",
+                            Path(temp),
+                            1000,
+                            cookies_text=cookies,
+                        )
+            self.assertEqual(
+                sorted(path.name for path in Path(temp).iterdir()),
+                ["final.mp3"]
+            )
 
-        self.assertEqual(info[2], "ok")
-        # أربع محاولات بالكوكيز ثم محاولة أخيرة بلا كوكيز.
-        self.assertEqual(len(calls), 5)
-        self.assertIsNone(calls[-1].get("cookiefile"))
-        self.assertEqual(
-            calls[-1]["extractor_args"]["youtube"]["player_client"],
-            list(url_media.YOUTUBE_BARE_CLIENTS)
+        self.assertEqual(size, len(b"audio"))
+        self.assertEqual(len(calls), 2)
+        # المحاولة الأولى بلا كوكيز والثانية بالكوكيز.
+        self.assertIsNone(calls[0].get("cookiefile"))
+        self.assertIsNotNone(calls[1].get("cookiefile"))
+        # التنزيل لا يدرج صيغًا تحتاج توكنًا غير متوفر.
+        for options in calls:
+            self.assertNotIn(
+                "missing_pot",
+                options.get("extractor_args", {}).get("youtube", {}).get(
+                    "formats", []
+                )
+            )
+
+    def test_download_logs_never_leak_cookie_values(self):
+        import contextlib
+        import io
+
+        secret = "SECRET-COOKIE-VALUE-987"
+        cookies = (
+            "# Netscape HTTP Cookie File\n"
+            f".youtube.com\tTRUE\t/\tTRUE\t0\tSID\t{secret}\n"
         )
-        # المحاولة الأولى طبيعية، والثانية تُدرج صيغ missing PO Token.
-        self.assertNotIn("extractor_args", calls[0])
-        self.assertIn(
-            "missing_pot",
-            calls[1]["extractor_args"]["youtube"]["formats"]
-        )
 
-    def test_pot_attempts_run_first_when_provider_ready(self):
-        """عند توفّر المزوّد نبدأ بمحاولة تحمل توكن إثبات الأصل."""
-        import sys
-        import types
+        def extract_info(options, calls):
+            raise RuntimeError(
+                "[youtube] abc: Sign in to confirm you're not a bot"
+            )
 
-        sys.modules.pop("yt_dlp", None)
+        fake_module, _ = self._install_fake_ytdlp(extract_info)
+        output = io.StringIO()
+        with TemporaryDirectory() as temp:
+            with mock.patch.dict("sys.modules", {"yt_dlp": fake_module}):
+                with mock.patch.object(
+                    url_media, "pot_provider_state", return_value="غير مثبّت"
+                ):
+                    with contextlib.redirect_stdout(output):
+                        with self.assertRaises(url_media.UrlDownloadError):
+                            url_media._download_youtube(
+                                "https://www.youtube.com/watch?v=abc",
+                                Path(temp),
+                                1000,
+                                cookies_text=cookies,
+                            )
+        self.assertNotIn(secret, output.getvalue())
 
-        calls = []
+    def test_download_keeps_raw_audio_when_ffmpeg_missing(self):
+        """لا نُهدر صوتًا نُزّل بنجاح لأن التحويل إلى mp3 تعذّر."""
+        def extract_info(options, calls):
+            if options.get("postprocessors"):
+                raise RuntimeError(
+                    "Postprocessing: ffprobe and ffmpeg not found. "
+                    "Please install or provide the path using --ffmpeg-location"
+                )
+            home = Path(options["paths"]["home"])
+            (home / "raw.m4a").write_bytes(b"audio")
+            return {"title": "ok", "formats": [], "acodec": "mp4a"}
 
-        class FakeYDL:
-            def __init__(self, options):
-                self.options = options
+        fake_module, calls = self._install_fake_ytdlp(extract_info)
 
-            def __enter__(self):
-                return self
+        with TemporaryDirectory() as temp:
+            with mock.patch.dict("sys.modules", {"yt_dlp": fake_module}):
+                with mock.patch.object(
+                    url_media, "pot_provider_state", return_value="غير مثبّت"
+                ):
+                    with mock.patch.object(
+                        url_media, "_file_has_audio", return_value=True
+                    ):
+                        _, size, _ = url_media._download_youtube(
+                            "https://www.youtube.com/watch?v=abc",
+                            Path(temp),
+                            1000,
+                        )
 
-            def __exit__(self, *exc):
-                return False
+        self.assertEqual(size, len(b"audio"))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("postprocessors", calls[0])
+        self.assertNotIn("postprocessors", calls[1])
 
-            def extract_info(self, url, download=True):
-                calls.append(self.options)
-                home = Path(self.options["paths"]["home"])
-                (home / "lecture.mp3").write_bytes(b"audio")
-                return {"title": "ok", "formats": []}
-
-        fake_module = types.ModuleType("yt_dlp")
-        fake_module.version = types.SimpleNamespace(__version__="2026.10.26")
-        fake_module.YoutubeDL = FakeYDL
-
+    def test_pot_attempts_used_when_js_free_clients_fail(self):
+        """عند جاهزية المزوّد تُجرَّب صيغ Web + PO بدل التكرار بلا فائدة."""
         cookies = (
             "# Netscape HTTP Cookie File\n"
             ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n"
         )
 
+        def extract_info(options, calls):
+            if "youtubepot-bgutilscript" not in options.get(
+                "extractor_args", {}
+            ):
+                raise RuntimeError(
+                    "ERROR: [youtube] abc: Requested format is not available"
+                )
+            home = Path(options["paths"]["home"])
+            (home / "final.mp3").write_bytes(b"audio")
+            return {"title": "ok", "formats": [], "acodec": "opus"}
+
+        fake_module, calls = self._install_fake_ytdlp(extract_info)
+
         with TemporaryDirectory() as temp:
-            with mock.patch.dict(sys.modules, {"yt_dlp": fake_module}):
+            with mock.patch.dict("sys.modules", {"yt_dlp": fake_module}):
                 with mock.patch.object(
                     url_media, "pot_provider_state", return_value="جاهز ✅"
                 ):
-                    info = url_media._download_youtube(
-                        "https://www.youtube.com/watch?v=abc",
-                        Path(temp),
-                        1000,
-                        cookies_text=cookies,
-                    )
+                    with mock.patch.object(
+                        url_media, "_file_has_audio", return_value=True
+                    ):
+                        url_media._download_youtube(
+                            "https://www.youtube.com/watch?v=abc",
+                            Path(temp),
+                            1000,
+                            cookies_text=cookies,
+                        )
 
-        self.assertEqual(info[2], "ok")
-        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls)
+        self.assertGreater(len(calls), 1)
+        last = calls[-1]
+        self.assertIn("youtubepot-bgutilscript", last["extractor_args"])
+        youtube = last["extractor_args"]["youtube"]
+        self.assertEqual(youtube["fetch_pot"], ["always"])
+        self.assertEqual(youtube["player_skip"], ["webpage"])
         self.assertEqual(
-            calls[0]["extractor_args"]["youtubepot-bgutilscript"][
-                "server_home"
-            ],
-            [url_media.POT_SERVER_HOME]
+            youtube["player_client"],
+            list(url_media._youtube_clients(
+                url_media.YOUTUBE_POT_CLIENTS[0]
+            ))
         )
-        self.assertIn(
-            "missing_pot",
-            calls[0]["extractor_args"]["youtube"]["formats"]
+        # المحاولات السابقة كانت بلا PO.
+        self.assertNotIn(
+            "youtubepot-bgutilscript", calls[0]["extractor_args"]
         )
 
 
@@ -546,6 +662,170 @@ class TestCookieStatus(unittest.TestCase):
     def test_cookie_names_state_never_leaks_values(self):
         text = ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsecret-value\n"
         self.assertNotIn("secret-value", url_media.cookie_names_state(text))
+
+
+class TestYoutubeClassification(unittest.TestCase):
+    def test_classifies_auth_errors(self):
+        self.assertEqual(
+            url_media.classify_youtube_error(
+                "ERROR: [youtube] abc: Sign in to confirm you're not a bot"
+            ),
+            "auth",
+        )
+
+    def test_classifies_player_errors(self):
+        for message in (
+            "Failed to extract any player response",
+            "The page needs to be reloaded",
+        ):
+            self.assertEqual(
+                url_media.classify_youtube_error(message), "player"
+            )
+
+    def test_classifies_format_and_fatal_and_download(self):
+        self.assertEqual(
+            url_media.classify_youtube_error(
+                "Requested format is not available"
+            ),
+            "format",
+        )
+        self.assertEqual(
+            url_media.classify_youtube_error("Video unavailable"), "fatal"
+        )
+        self.assertEqual(
+            url_media.classify_youtube_error("HTTP Error 403: Forbidden"),
+            "download",
+        )
+
+    def test_classifies_missing_ffmpeg(self):
+        self.assertEqual(
+            url_media.classify_youtube_error(
+                "Postprocessing: ffprobe and ffmpeg not found"
+            ),
+            "ffmpeg",
+        )
+        error = url_media._youtube_failure(
+            "Postprocessing: ffprobe and ffmpeg not found"
+        )
+        self.assertIn("ffmpeg", str(error))
+
+    def test_redacts_sensitive_query_values(self):
+        message = (
+            "https://x/y?signature=SECRET123&token=SECRET456&pot=SECRET789"
+            "&expire=123&id=ok /pot/SECRETPOT"
+        )
+        redacted = url_media._redact_media_urls(message)
+        for secret in ("SECRET123", "SECRET456", "SECRET789", "SECRETPOT"):
+            self.assertNotIn(secret, redacted)
+        self.assertIn("id=ok", redacted)
+
+    def test_short_reason_strips_prefix_and_redacts(self):
+        reason = url_media._short_reason(
+            "ERROR: [youtube] abc: failed https://x/y?token=SECRET"
+        )
+        self.assertFalse(reason.startswith("ERROR"))
+        self.assertNotIn("SECRET", reason)
+
+
+class TestFormatsClassification(unittest.TestCase):
+    def test_counts_only_usable_audio(self):
+        info = {
+            "formats": [
+                {"format_id": "sb0", "acodec": "none", "vcodec": "none"},
+                {"format_id": "251", "acodec": "opus", "vcodec": "none"},
+                {
+                    "format_id": "139",
+                    "acodec": "mp4a",
+                    "vcodec": "none",
+                    "format_note": "MISSING POT",
+                },
+                {
+                    "format_id": "140-drc",
+                    "acodec": "mp4a",
+                    "vcodec": "none",
+                    "has_drm": "maybe",
+                },
+                {
+                    "format_id": "22",
+                    "acodec": "mp4a",
+                    "vcodec": "avc1",
+                },
+            ]
+        }
+        summary = url_media.youtube_formats_summary(info)
+        self.assertEqual(summary["total"], 5)
+        self.assertEqual(summary["audio"], 2)
+        self.assertEqual(summary["missing_pot"], 1)
+        self.assertEqual(summary["drm"], 1)
+        self.assertEqual(
+            [fmt["format_id"] for fmt in summary["formats"]],
+            ["251", "22"],
+        )
+
+    def test_combined_video_audio_counts_as_audio(self):
+        info = {"formats": [
+            {"format_id": "18", "acodec": "mp4a", "vcodec": "avc1"}
+        ]}
+        self.assertEqual(len(url_media.usable_audio_formats(info)), 1)
+
+    def test_info_has_audio_checks_requested_formats(self):
+        self.assertFalse(url_media._info_has_audio({"acodec": "none"}))
+        self.assertTrue(url_media._info_has_audio({"acodec": "opus"}))
+        self.assertFalse(url_media._info_has_audio({
+            "requested_formats": [
+                {"acodec": "none"}, {"acodec": "none"}
+            ]
+        }))
+        self.assertTrue(url_media._info_has_audio({
+            "requested_formats": [
+                {"acodec": "none"}, {"acodec": "opus"}
+            ]
+        }))
+
+    def test_cleanup_removes_only_new_files(self):
+        with TemporaryDirectory() as temp:
+            home = Path(temp)
+            (home / "old.mp3").write_bytes(b"old")
+            before = url_media._attempt_files(home)
+            (home / "new.mp3").write_bytes(b"new")
+            url_media._cleanup_attempt_files(home, before)
+            self.assertEqual(
+                sorted(path.name for path in home.iterdir()), ["old.mp3"]
+            )
+
+
+class TestCookieAuthState(unittest.TestCase):
+    @staticmethod
+    def _cookie_text(**values):
+        lines = ["# Netscape HTTP Cookie File"]
+        for name, value in values.items():
+            lines.append(f".youtube.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}")
+        return "\n".join(lines)
+
+    def test_requires_login_info_and_sapisid(self):
+        full = self._cookie_text(LOGIN_INFO="a", SAPISID="b")
+        self.assertIn("موثّقة", url_media.cookies_auth_state(full))
+        self.assertTrue(
+            url_media._cookies_authenticated(
+                url_media._parse_netscape_cookies(full)
+            )
+        )
+
+    def test_missing_login_info_is_reported_without_values(self):
+        text = self._cookie_text(SAPISID="SECRET-SAPISID-VALUE")
+        state = url_media.cookies_auth_state(text)
+        self.assertIn("غير موثّقة", state)
+        self.assertIn("LOGIN_INFO", state)
+        self.assertNotIn("SECRET-SAPISID-VALUE", state)
+
+    def test_secure_3papisid_is_accepted(self):
+        text = self._cookie_text(
+            LOGIN_INFO="a", **{"__Secure-3PAPISID": "b"}
+        )
+        self.assertIn("موثّقة", url_media.cookies_auth_state(text))
+
+    def test_ejs_state_is_reported(self):
+        self.assertTrue(url_media.ejs_solver_state())
 
 
 class TestDisplayName(unittest.TestCase):
