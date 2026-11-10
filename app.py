@@ -859,7 +859,7 @@ def contributors_text():
     return "عدة نماذج لغوية ساعدت في التصميم والكتابة والاختبار"
 
 
-JOBS_FILE = Path("/tmp/waqqad_jobs.json")
+JOBS_FILE = TMP_DIR / "waqqad_jobs.json"
 jobs_lock = threading.Lock()
 
 SUBMIT_TIMEOUT = 1800
@@ -2928,7 +2928,7 @@ def _is_cookies_document(message):
 def handle_cookies_upload(message, chat_id):
     """يستقبل cookies.txt من المطوّر ويحفظه لاستخدامه في يوتيوب."""
     file_id = (message.get("document") or {}).get("file_id")
-    work_dir = Path("/tmp") / f"waqqad_cookies_{uuid.uuid4().hex}"
+    work_dir = TMP_DIR / f"waqqad_cookies_{uuid.uuid4().hex}"
     work_dir.mkdir(parents=True, exist_ok=True)
     target = work_dir / "cookies.txt"
 
@@ -3018,7 +3018,7 @@ def handle_ytinfo_command(chat_id, user_id, argument):
         _YTINFO_RUNNING.add(pending_key)
 
     def _sweep():
-        work_dir = Path("/tmp") / f"waqqad_ytinfo_{uuid.uuid4().hex}"
+        work_dir = TMP_DIR / f"waqqad_ytinfo_{uuid.uuid4().hex}"
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
             runtime = url_media.js_runtime_state()
@@ -3509,7 +3509,7 @@ def handle_bot_attachment(chat, sender, attachment):
         return
 
     job_id = str(uuid.uuid4())
-    original_dir = Path("/tmp") / f"waqqad_{job_id}" / "original"
+    original_dir = get_work_dir(job_id) / "original"
     original_dir.mkdir(parents=True, exist_ok=True)
     safe_name = _safe_upload_name(attachment.get("file_name"))
     destination = (original_dir / safe_name).resolve()
@@ -3550,7 +3550,8 @@ def handle_bot_attachment(chat, sender, attachment):
             run_bot_job,
             job_id,
             attachment,
-            destination
+            destination,
+            user_id=str(user_id)
         )
     except Exception as e:
         print(f"[QUEUE ERROR] job {job_id}: {e}", flush=True)
@@ -3572,8 +3573,7 @@ def create_url_job(url, user_id, sender, source):
     """ينشئ مهمة من رابط قبل تنزيله، حتى تظهر حالتها فورًا."""
     job_id = str(uuid.uuid4())
     work_dir = (
-        Path("/tmp")
-        / f"waqqad_{job_id}"
+        get_work_dir(job_id)
         / "original"
     )
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -3745,7 +3745,8 @@ def handle_bot_url(chat, sender, url):
             job_id,
             url,
             destination,
-            True
+            True,
+            user_id=str(user_id)
         )
     except Exception as e:
         print(f"[QUEUE ERROR] url job {job_id}: {e}", flush=True)
@@ -4480,10 +4481,7 @@ def transcribe():
 
     job_id = str(uuid.uuid4())
 
-    work_dir = (
-        Path("/tmp")
-        / f"waqqad_{job_id}"
-    )
+    work_dir = get_work_dir(job_id)
 
     original_dir = (
         work_dir
@@ -4535,7 +4533,8 @@ def transcribe():
         job_id,
         process_transcription_job,
         job_id,
-        input_file
+        input_file,
+        user_id=telegram_user_id
     )
 
     return jsonify({
@@ -4579,7 +4578,8 @@ def transcribe_url():
         job_id,
         url,
         destination,
-        False
+        False,
+        user_id=telegram_user_id
     )
 
     return jsonify({

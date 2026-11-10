@@ -20,6 +20,11 @@ import app
 
 
 class CohereParallelTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(app, "COHERE_API_KEYS", ["key1", "key2", "key3"])
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
     def test_parts_preserve_order_even_with_out_of_order_completion(self):
         parts = [
             Path("/tmp/part_001.mp3"),
