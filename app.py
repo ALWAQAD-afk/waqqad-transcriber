@@ -17,6 +17,7 @@ from warraq_miniapp import register_warraq_miniapp
 from command_text import normalize_command_text
 from update_gate import SeenUpdates, is_stale_message
 import requests
+import concurrent.futures
 
 # --- إضافة التنقيح v3 - نظام 3 ملفات تلقائي + تقسيم دفعات ---
 try:
@@ -123,6 +124,7 @@ COHERE_LANGUAGE = "ar"
 COHERE_SEGMENT_SECONDS = 7200
 COHERE_MAX_FILE_BYTES = 24_000_000
 COHERE_TIMEOUT = 1800
+COHERE_CONCURRENCY = max(1, int(os.environ.get("COHERE_CONCURRENCY", "3")))
 
 # الصيغ التي يقبلها Cohere مباشرة دون تحويل.
 COHERE_DIRECT_EXTENSIONS = {
@@ -2082,28 +2084,49 @@ def process_transcription_job(job_id, input_file):
         )
         return
 
-    parts_dir = (
-        Path("/tmp")
-        / f"waqqad_{job_id}"
-        / "cohere_parts"
-    )
+    parts_dir = get_work_dir(job_id) / "cohere_parts"
 
     try:
         # إن فشل FFmpeg هنا فهو خطأ محلي، فلا Deepgram.
         parts = prepare_cohere_parts(job_id, input_file)
 
-        transcripts = []
+        total_parts = len(parts)
+        transcripts_by_index = {}
         used_keys = []
+        keys_lock = threading.Lock()
 
-        for index, part in enumerate(parts, start=1):
-            transcript, key_index = cohere_transcribe_part(
+        def _transcribe_worker(item):
+            part_index, part_file = item
+            transcript_text, key_idx = cohere_transcribe_part(
                 job_id,
-                part,
-                index,
-                len(parts)
+                part_file,
+                part_index,
+                total_parts,
             )
-            transcripts.append(transcript.strip())
-            used_keys.append(key_index)
+            with keys_lock:
+                used_keys.append(key_idx)
+            return part_index, transcript_text.strip()
+
+        if total_parts <= 1 or COHERE_CONCURRENCY <= 1:
+            for index, part in enumerate(parts, start=1):
+                idx, text = _transcribe_worker((index, part))
+                transcripts_by_index[idx] = text
+        else:
+            max_workers = min(total_parts, COHERE_CONCURRENCY)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(_transcribe_worker, (index, part))
+                    for index, part in enumerate(parts, start=1)
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    idx, text = future.result()
+                    transcripts_by_index[idx] = text
+
+        ordered_transcripts = [
+            transcripts_by_index[i]
+            for i in range(1, total_parts + 1)
+            if transcripts_by_index.get(i)
+        ]
 
         update_job(
             job_id,
@@ -2114,7 +2137,7 @@ def process_transcription_job(job_id, input_file):
         )
 
         final_text = "\n\n".join(
-            t for t in transcripts if t
+            t for t in ordered_transcripts if t
         )
 
         if not final_text.strip():
