@@ -1038,15 +1038,7 @@ def ensure_webhook_updates():
 # تخزين المهام - PostgreSQL (Neon)
 # ============================================================
 
-import psycopg
-from psycopg.rows import dict_row
-
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
-def get_db_connection():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+from db import get_db_connection, get_pool
 
 def _safe_upload_name(original_name):
     """اسم ملف آمن مع الحفاظ على امتداده، دون قيود على الامتدادات."""

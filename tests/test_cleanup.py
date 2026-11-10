@@ -1,7 +1,18 @@
+import os
 import unittest
 from unittest import mock
 from pathlib import Path
 import shutil
+
+os.environ.update({
+    "TELEGRAM_BOT_TOKEN": "123:TEST",
+    "WARRAQ_BOT_TOKEN": "456:TEST",
+    "WARRAQ_STORAGE_CHAT_ID": "-1001",
+    "WARRAQ_DATABASE_URL": "postgresql://u:p@127.0.0.1:1/db?connect_timeout=1",
+    "DATABASE_URL": "postgresql://u:p@127.0.0.1:1/db?connect_timeout=1",
+    "TELEGRAM_WEBHOOK_SECRET": "secret",
+    "WARRAQ_WEBHOOK_SECRET": "secret",
+})
 
 import app
 

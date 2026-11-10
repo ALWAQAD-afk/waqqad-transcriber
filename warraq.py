@@ -36,19 +36,9 @@ log = logging.getLogger("alwarraq")
 # Reuse HTTPS/TLS connections to Telegram instead of reconnecting every request.
 HTTP = requests.Session()
 
-# Keep PostgreSQL connections warm instead of opening a new TLS connection
-# on every button press.
-POOL = ConnectionPool(
-    conninfo=DATABASE_URL,
-    min_size=1,
-    max_size=4,
-    timeout=10,
-    kwargs={
-        "row_factory": dict_row,
-        "autocommit": False,
-    },
-    open=True,
-)
+from db import get_pool
+
+POOL = get_pool(DATABASE_URL)
 
 DEFAULT_FOLDERS = [
     ("كتب شرعية", "📚"),
