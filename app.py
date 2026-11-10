@@ -1934,7 +1934,8 @@ def submit_to_deepgram(job_id, input_file, fallback_reason=None):
             status="processing",
             stage="waiting_deepgram",
             engine="deepgram",
-            deepgram_request_id=request_id
+            deepgram_request_id=request_id,
+            deepgram_submitted_at=time.time(),
         )
 
         print(
@@ -1962,6 +1963,115 @@ def submit_to_deepgram(job_id, input_file, fallback_reason=None):
             input_file.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+DEEPGRAM_WAIT_TIMEOUT_SECONDS = int(
+    os.environ.get("DEEPGRAM_WAIT_TIMEOUT_SECONDS", "3600")
+)
+
+
+def reap_stale_deepgram_jobs(max_age_seconds=None):
+    """
+    يفحص المهام المعلقة في waiting_deepgram التي تجاوزت المهلة الزمنية.
+    يحدث حالتها إلى failed ويشعر المستخدم وينظف الملفات المؤقتة بأمان لمنع بقاء أي مهمة معلقة.
+    """
+    if max_age_seconds is None:
+        max_age_seconds = DEEPGRAM_WAIT_TIMEOUT_SECONDS
+
+    cutoff = time.time() - max_age_seconds
+    reaped = []
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT job_id, data FROM jobs
+                    WHERE data->>'status' = 'processing'
+                      AND data->>'stage' = 'waiting_deepgram'
+                    FOR UPDATE
+                    """
+                )
+                rows = cur.fetchall()
+                for row in rows:
+                    jid = row["job_id"]
+                    data = row["data"]
+                    if isinstance(data, str):
+                        data = json.loads(data)
+
+                    submitted_at = data.get("deepgram_submitted_at")
+                    started_at = data.get("started_at")
+                    timestamp = submitted_at or started_at
+
+                    if timestamp and float(timestamp) > cutoff:
+                        continue
+
+                    data["status"] = "failed"
+                    data["stage"] = "error"
+                    data["error"] = "انتهت مهلة انتظار استجابة Deepgram (تجاوزت المهلة المحددة)."
+                    data["timed_out_at"] = time.time()
+
+                    cur.execute(
+                        """
+                        UPDATE jobs
+                        SET data = %s,
+                            updated_at = NOW()
+                        WHERE job_id = %s
+                        """,
+                        (json.dumps(data), jid)
+                    )
+                    reaped.append((jid, data))
+
+                conn.commit()
+    except Exception as e:
+        print(f"[REAPER ERROR] Failed to reap stale Deepgram jobs: {e}", flush=True)
+        return []
+
+    for jid, data in reaped:
+        print(f"[REAPER] Job {jid} timed out waiting for Deepgram callback", flush=True)
+        cleanup_job_workdir(jid)
+        telegram_user_id = data.get("telegram_user_id")
+        if telegram_user_id:
+            try:
+                original_filename = data.get("original_filename") or "التسجيل"
+                telegram_send_message(
+                    telegram_user_id,
+                    f"❌ {original_filename}: تعذّر استلام نتيجة التفريغ من المحرك الاحتياطي (انتهت مهلة الانتظار)."
+                )
+            except Exception as e:
+                print(f"[REAPER NOTIFY ERROR] Job {jid}: {e}", flush=True)
+
+    return [jid for jid, _ in reaped]
+
+
+def _deepgram_reaper_loop(interval_seconds=600):
+    while True:
+        try:
+            time.sleep(interval_seconds)
+            reap_stale_deepgram_jobs()
+        except Exception as e:
+            print(f"[REAPER LOOP ERROR] {e}", flush=True)
+
+
+_REAPER_STARTED = False
+_REAPER_LOCK = threading.Lock()
+
+
+def start_deepgram_reaper(interval_seconds=600):
+    global _REAPER_STARTED
+    with _REAPER_LOCK:
+        if _REAPER_STARTED:
+            return
+        _REAPER_STARTED = True
+        thread = threading.Thread(
+            target=_deepgram_reaper_loop,
+            args=(interval_seconds,),
+            name="deepgram-reaper",
+            daemon=True,
+        )
+        thread.start()
+        print("[REAPER] Deepgram reaper thread started", flush=True)
+
 
 
 def process_transcription_job(job_id, input_file):
@@ -4504,6 +4614,19 @@ def deepgram_callback(job_id):
             "error": "unknown job"
         }), 404
 
+    # منع تنفيذ المهمة مرتين أو تضارب الحالات عند وصول Callback متأخر
+    current_status = job.get("status")
+    if current_status in ("completed", "failed"):
+        print(
+            f"[CALLBACK] Ignored late Deepgram callback for job {job_id} "
+            f"(current status: {current_status})",
+            flush=True
+        )
+        return jsonify({
+            "status": "ignored",
+            "reason": f"job already {current_status}"
+        }), 200
+
     try:
 
         data = request.get_json(
@@ -4782,6 +4905,12 @@ def refine_job(job_id):
     except Exception as e:
         print(f"[REFINE ERROR] job {job_id}: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
+
+
+try:
+    start_deepgram_reaper()
+except Exception as e:
+    print(f"[REAPER] Startup warning: {e}", flush=True)
 
 
 if __name__ == "__main__":
