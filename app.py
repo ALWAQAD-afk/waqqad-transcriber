@@ -82,6 +82,25 @@ CORS(
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TMP_DIR = Path(os.environ.get("TMPDIR", "/tmp"))
+
+
+def get_work_dir(job_id):
+    """إرجاع مسار مجلد العمل المؤقت للمهمة."""
+    return TMP_DIR / f"waqqad_{job_id}"
+
+
+def cleanup_job_workdir(job_id):
+    """يحذف مجلد العمل المؤقت للمهمة بأمان وبشكل idempotent."""
+    if not job_id:
+        return
+    work_dir = get_work_dir(job_id)
+    try:
+        if work_dir.exists():
+            shutil.rmtree(work_dir, ignore_errors=True)
+            print(f"[CLEANUP] Removed workdir for job {job_id}", flush=True)
+    except Exception as e:
+        print(f"[CLEANUP ERROR] Failed to clean workdir for job {job_id}: {e}", flush=True)
 
 # مفتاح واحد أو عدة مفاتيح مفصولة بفواصل:
 # COHERE_API_KEYS=key1,key2,key3
@@ -1150,7 +1169,7 @@ def fail_orphaned_jobs():
 def cleanup_stale_workdirs():
     """حذف مجلدات العمل المؤقتة من تشغيل سابق."""
     removed = 0
-    for path in Path("/tmp").glob("waqqad_*"):
+    for path in TMP_DIR.glob("waqqad_*"):
         if path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
             removed += 1
@@ -1404,7 +1423,7 @@ def _clean_parts_dir(parts_dir):
 
 def prepare_cohere_parts(job_id, input_file):
     """يجهّز قطع Cohere بأسرع مسار ممكن دون تغيير النص أو الصوت."""
-    work_dir = Path("/tmp") / f"waqqad_{job_id}"
+    work_dir = get_work_dir(job_id)
     parts_dir = work_dir / "cohere_parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1686,7 +1705,7 @@ def cohere_transcribe_part(job_id, part, part_index, part_count):
 
 def finalize_transcript(job_id, transcript, engine):
     """Save the transcript using the original filename and send a short summary."""
-    work_dir = Path("/tmp") / f"waqqad_{job_id}"
+    work_dir = get_work_dir(job_id)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     job = get_job(job_id) or {}
@@ -1827,6 +1846,9 @@ def finalize_transcript(job_id, transcript, engine):
             print(f"[AUTO-REFINE] Thread started for job {job_id}", flush=True)
         except Exception as e:
             print(f"[AUTO-REFINE] Failed to start thread: {e}", flush=True)
+            cleanup_job_workdir(job_id)
+    else:
+        cleanup_job_workdir(job_id)
 
 def submit_to_deepgram(job_id, input_file, fallback_reason=None):
     """Deepgram Nova-3: المحرك الاحتياطي، مع callback كما في V3."""
@@ -4079,7 +4101,7 @@ def _refine_failure_hint(exc):
     return "سبب مؤقت في خدمة التدقيق."
 
 
-def send_refined_versions_async(job_id, raw_output_file):
+def _send_refined_versions_impl(job_id, raw_output_file):
     """ينشئ ويرسل النسختين المصححة والمحسنة تلقائياً."""
     if not REFINE_ENABLED or refine_document is None:
         print(f"[AUTO-REFINE] Disabled for job {job_id}", flush=True)
@@ -4256,6 +4278,14 @@ def send_refined_versions_async(job_id, raw_output_file):
         delete_status_message(job_id, prefix="refine")
         # ذا تعذّرت الأزرار، التقييم يبقى يظهر مرة واحدة بعد التسليم.
         send_feedback_prompt(job_id, telegram_user_id)
+
+
+def send_refined_versions_async(job_id, raw_output_file):
+    """ينشئ ويرسل النسختين المصححة والمحسنة تلقائياً مع ضمان تنظيف مجلد العمل."""
+    try:
+        _send_refined_versions_impl(job_id, raw_output_file)
+    finally:
+        cleanup_job_workdir(job_id)
 
 
 # ============================================================
