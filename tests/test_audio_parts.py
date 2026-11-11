@@ -36,13 +36,13 @@ class AudioPartsTests(unittest.TestCase):
     def tearDown(self):
         for job_id in self.job_ids:
             shutil.rmtree(
-                Path("/tmp") / f"waqqad_{job_id}",
+                app.get_work_dir(job_id),
                 ignore_errors=True,
             )
 
     def _input_file(self, job_id, name, size):
         self.job_ids.append(job_id)
-        original = Path("/tmp") / f"waqqad_{job_id}" / "original"
+        original = app.get_work_dir(job_id) / "original"
         original.mkdir(parents=True, exist_ok=True)
         path = original / name
         path.write_bytes(b"x" * size)

@@ -78,10 +78,11 @@ def build_search_terms(query):
     return [search_variants(token) for token in tokens]
 
 
+from db import get_db_connection
+
+
 def _connect():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    return get_db_connection()
 
 
 def init_table():

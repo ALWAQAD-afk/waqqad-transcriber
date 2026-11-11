@@ -17,6 +17,7 @@ from warraq_miniapp import register_warraq_miniapp
 from command_text import normalize_command_text
 from update_gate import SeenUpdates, is_stale_message
 import requests
+import concurrent.futures
 
 # --- إضافة التنقيح v3 - نظام 3 ملفات تلقائي + تقسيم دفعات ---
 try:
@@ -82,6 +83,25 @@ CORS(
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TMP_DIR = Path(os.environ.get("TMPDIR", "/tmp"))
+
+
+def get_work_dir(job_id):
+    """إرجاع مسار مجلد العمل المؤقت للمهمة."""
+    return TMP_DIR / f"waqqad_{job_id}"
+
+
+def cleanup_job_workdir(job_id):
+    """يحذف مجلد العمل المؤقت للمهمة بأمان وبشكل idempotent."""
+    if not job_id:
+        return
+    work_dir = get_work_dir(job_id)
+    try:
+        if work_dir.exists():
+            shutil.rmtree(work_dir, ignore_errors=True)
+            print(f"[CLEANUP] Removed workdir for job {job_id}", flush=True)
+    except Exception as e:
+        print(f"[CLEANUP ERROR] Failed to clean workdir for job {job_id}: {e}", flush=True)
 
 # مفتاح واحد أو عدة مفاتيح مفصولة بفواصل:
 # COHERE_API_KEYS=key1,key2,key3
@@ -104,6 +124,7 @@ COHERE_LANGUAGE = "ar"
 COHERE_SEGMENT_SECONDS = 7200
 COHERE_MAX_FILE_BYTES = 24_000_000
 COHERE_TIMEOUT = 1800
+COHERE_CONCURRENCY = max(1, int(os.environ.get("COHERE_CONCURRENCY", "3")))
 
 # الصيغ التي يقبلها Cohere مباشرة دون تحويل.
 COHERE_DIRECT_EXTENSIONS = {
@@ -838,7 +859,7 @@ def contributors_text():
     return "عدة نماذج لغوية ساعدت في التصميم والكتابة والاختبار"
 
 
-JOBS_FILE = Path("/tmp/waqqad_jobs.json")
+JOBS_FILE = TMP_DIR / "waqqad_jobs.json"
 jobs_lock = threading.Lock()
 
 SUBMIT_TIMEOUT = 1800
@@ -1019,15 +1040,7 @@ def ensure_webhook_updates():
 # تخزين المهام - PostgreSQL (Neon)
 # ============================================================
 
-import psycopg
-from psycopg.rows import dict_row
-
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
-def get_db_connection():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+from db import get_db_connection, get_pool
 
 def _safe_upload_name(original_name):
     """اسم ملف آمن مع الحفاظ على امتداده، دون قيود على الامتدادات."""
@@ -1150,7 +1163,7 @@ def fail_orphaned_jobs():
 def cleanup_stale_workdirs():
     """حذف مجلدات العمل المؤقتة من تشغيل سابق."""
     removed = 0
-    for path in Path("/tmp").glob("waqqad_*"):
+    for path in TMP_DIR.glob("waqqad_*"):
         if path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
             removed += 1
@@ -1404,7 +1417,7 @@ def _clean_parts_dir(parts_dir):
 
 def prepare_cohere_parts(job_id, input_file):
     """يجهّز قطع Cohere بأسرع مسار ممكن دون تغيير النص أو الصوت."""
-    work_dir = Path("/tmp") / f"waqqad_{job_id}"
+    work_dir = get_work_dir(job_id)
     parts_dir = work_dir / "cohere_parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1686,7 +1699,7 @@ def cohere_transcribe_part(job_id, part, part_index, part_count):
 
 def finalize_transcript(job_id, transcript, engine):
     """Save the transcript using the original filename and send a short summary."""
-    work_dir = Path("/tmp") / f"waqqad_{job_id}"
+    work_dir = get_work_dir(job_id)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     job = get_job(job_id) or {}
@@ -1827,6 +1840,9 @@ def finalize_transcript(job_id, transcript, engine):
             print(f"[AUTO-REFINE] Thread started for job {job_id}", flush=True)
         except Exception as e:
             print(f"[AUTO-REFINE] Failed to start thread: {e}", flush=True)
+            cleanup_job_workdir(job_id)
+    else:
+        cleanup_job_workdir(job_id)
 
 def submit_to_deepgram(job_id, input_file, fallback_reason=None):
     """Deepgram Nova-3: المحرك الاحتياطي، مع callback كما في V3."""
@@ -1912,7 +1928,8 @@ def submit_to_deepgram(job_id, input_file, fallback_reason=None):
             status="processing",
             stage="waiting_deepgram",
             engine="deepgram",
-            deepgram_request_id=request_id
+            deepgram_request_id=request_id,
+            deepgram_submitted_at=time.time(),
         )
 
         print(
@@ -1942,6 +1959,115 @@ def submit_to_deepgram(job_id, input_file, fallback_reason=None):
             pass
 
 
+DEEPGRAM_WAIT_TIMEOUT_SECONDS = int(
+    os.environ.get("DEEPGRAM_WAIT_TIMEOUT_SECONDS", "3600")
+)
+
+
+def reap_stale_deepgram_jobs(max_age_seconds=None):
+    """
+    يفحص المهام المعلقة في waiting_deepgram التي تجاوزت المهلة الزمنية.
+    يحدث حالتها إلى failed ويشعر المستخدم وينظف الملفات المؤقتة بأمان لمنع بقاء أي مهمة معلقة.
+    """
+    if max_age_seconds is None:
+        max_age_seconds = DEEPGRAM_WAIT_TIMEOUT_SECONDS
+
+    cutoff = time.time() - max_age_seconds
+    reaped = []
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT job_id, data FROM jobs
+                    WHERE data->>'status' = 'processing'
+                      AND data->>'stage' = 'waiting_deepgram'
+                    FOR UPDATE
+                    """
+                )
+                rows = cur.fetchall()
+                for row in rows:
+                    jid = row["job_id"]
+                    data = row["data"]
+                    if isinstance(data, str):
+                        data = json.loads(data)
+
+                    submitted_at = data.get("deepgram_submitted_at")
+                    started_at = data.get("started_at")
+                    timestamp = submitted_at or started_at
+
+                    if timestamp and float(timestamp) > cutoff:
+                        continue
+
+                    data["status"] = "failed"
+                    data["stage"] = "error"
+                    data["error"] = "انتهت مهلة انتظار استجابة Deepgram (تجاوزت المهلة المحددة)."
+                    data["timed_out_at"] = time.time()
+
+                    cur.execute(
+                        """
+                        UPDATE jobs
+                        SET data = %s,
+                            updated_at = NOW()
+                        WHERE job_id = %s
+                        """,
+                        (json.dumps(data), jid)
+                    )
+                    reaped.append((jid, data))
+
+                conn.commit()
+    except Exception as e:
+        print(f"[REAPER ERROR] Failed to reap stale Deepgram jobs: {e}", flush=True)
+        return []
+
+    for jid, data in reaped:
+        print(f"[REAPER] Job {jid} timed out waiting for Deepgram callback", flush=True)
+        cleanup_job_workdir(jid)
+        telegram_user_id = data.get("telegram_user_id")
+        if telegram_user_id:
+            try:
+                original_filename = data.get("original_filename") or "التسجيل"
+                telegram_send_message(
+                    telegram_user_id,
+                    f"❌ {original_filename}: تعذّر استلام نتيجة التفريغ من المحرك الاحتياطي (انتهت مهلة الانتظار)."
+                )
+            except Exception as e:
+                print(f"[REAPER NOTIFY ERROR] Job {jid}: {e}", flush=True)
+
+    return [jid for jid, _ in reaped]
+
+
+def _deepgram_reaper_loop(interval_seconds=600):
+    while True:
+        try:
+            time.sleep(interval_seconds)
+            reap_stale_deepgram_jobs()
+        except Exception as e:
+            print(f"[REAPER LOOP ERROR] {e}", flush=True)
+
+
+_REAPER_STARTED = False
+_REAPER_LOCK = threading.Lock()
+
+
+def start_deepgram_reaper(interval_seconds=600):
+    global _REAPER_STARTED
+    with _REAPER_LOCK:
+        if _REAPER_STARTED:
+            return
+        _REAPER_STARTED = True
+        thread = threading.Thread(
+            target=_deepgram_reaper_loop,
+            args=(interval_seconds,),
+            name="deepgram-reaper",
+            daemon=True,
+        )
+        thread.start()
+        print("[REAPER] Deepgram reaper thread started", flush=True)
+
+
+
 def process_transcription_job(job_id, input_file):
     """
     Cohere هو المحرك الأساسي.
@@ -1958,28 +2084,49 @@ def process_transcription_job(job_id, input_file):
         )
         return
 
-    parts_dir = (
-        Path("/tmp")
-        / f"waqqad_{job_id}"
-        / "cohere_parts"
-    )
+    parts_dir = get_work_dir(job_id) / "cohere_parts"
 
     try:
         # إن فشل FFmpeg هنا فهو خطأ محلي، فلا Deepgram.
         parts = prepare_cohere_parts(job_id, input_file)
 
-        transcripts = []
+        total_parts = len(parts)
+        transcripts_by_index = {}
         used_keys = []
+        keys_lock = threading.Lock()
 
-        for index, part in enumerate(parts, start=1):
-            transcript, key_index = cohere_transcribe_part(
+        def _transcribe_worker(item):
+            part_index, part_file = item
+            transcript_text, key_idx = cohere_transcribe_part(
                 job_id,
-                part,
-                index,
-                len(parts)
+                part_file,
+                part_index,
+                total_parts,
             )
-            transcripts.append(transcript.strip())
-            used_keys.append(key_index)
+            with keys_lock:
+                used_keys.append(key_idx)
+            return part_index, transcript_text.strip()
+
+        if total_parts <= 1 or COHERE_CONCURRENCY <= 1:
+            for index, part in enumerate(parts, start=1):
+                idx, text = _transcribe_worker((index, part))
+                transcripts_by_index[idx] = text
+        else:
+            max_workers = min(total_parts, COHERE_CONCURRENCY)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(_transcribe_worker, (index, part))
+                    for index, part in enumerate(parts, start=1)
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    idx, text = future.result()
+                    transcripts_by_index[idx] = text
+
+        ordered_transcripts = [
+            transcripts_by_index[i]
+            for i in range(1, total_parts + 1)
+            if transcripts_by_index.get(i)
+        ]
 
         update_job(
             job_id,
@@ -1990,7 +2137,7 @@ def process_transcription_job(job_id, input_file):
         )
 
         final_text = "\n\n".join(
-            t for t in transcripts if t
+            t for t in ordered_transcripts if t
         )
 
         if not final_text.strip():
@@ -2781,7 +2928,7 @@ def _is_cookies_document(message):
 def handle_cookies_upload(message, chat_id):
     """يستقبل cookies.txt من المطوّر ويحفظه لاستخدامه في يوتيوب."""
     file_id = (message.get("document") or {}).get("file_id")
-    work_dir = Path("/tmp") / f"waqqad_cookies_{uuid.uuid4().hex}"
+    work_dir = TMP_DIR / f"waqqad_cookies_{uuid.uuid4().hex}"
     work_dir.mkdir(parents=True, exist_ok=True)
     target = work_dir / "cookies.txt"
 
@@ -2871,7 +3018,7 @@ def handle_ytinfo_command(chat_id, user_id, argument):
         _YTINFO_RUNNING.add(pending_key)
 
     def _sweep():
-        work_dir = Path("/tmp") / f"waqqad_ytinfo_{uuid.uuid4().hex}"
+        work_dir = TMP_DIR / f"waqqad_ytinfo_{uuid.uuid4().hex}"
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
             runtime = url_media.js_runtime_state()
@@ -3362,7 +3509,7 @@ def handle_bot_attachment(chat, sender, attachment):
         return
 
     job_id = str(uuid.uuid4())
-    original_dir = Path("/tmp") / f"waqqad_{job_id}" / "original"
+    original_dir = get_work_dir(job_id) / "original"
     original_dir.mkdir(parents=True, exist_ok=True)
     safe_name = _safe_upload_name(attachment.get("file_name"))
     destination = (original_dir / safe_name).resolve()
@@ -3403,7 +3550,8 @@ def handle_bot_attachment(chat, sender, attachment):
             run_bot_job,
             job_id,
             attachment,
-            destination
+            destination,
+            user_id=str(user_id)
         )
     except Exception as e:
         print(f"[QUEUE ERROR] job {job_id}: {e}", flush=True)
@@ -3425,8 +3573,7 @@ def create_url_job(url, user_id, sender, source):
     """ينشئ مهمة من رابط قبل تنزيله، حتى تظهر حالتها فورًا."""
     job_id = str(uuid.uuid4())
     work_dir = (
-        Path("/tmp")
-        / f"waqqad_{job_id}"
+        get_work_dir(job_id)
         / "original"
     )
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -3598,7 +3745,8 @@ def handle_bot_url(chat, sender, url):
             job_id,
             url,
             destination,
-            True
+            True,
+            user_id=str(user_id)
         )
     except Exception as e:
         print(f"[QUEUE ERROR] url job {job_id}: {e}", flush=True)
@@ -4079,7 +4227,7 @@ def _refine_failure_hint(exc):
     return "سبب مؤقت في خدمة التدقيق."
 
 
-def send_refined_versions_async(job_id, raw_output_file):
+def _send_refined_versions_impl(job_id, raw_output_file):
     """ينشئ ويرسل النسختين المصححة والمحسنة تلقائياً."""
     if not REFINE_ENABLED or refine_document is None:
         print(f"[AUTO-REFINE] Disabled for job {job_id}", flush=True)
@@ -4258,6 +4406,14 @@ def send_refined_versions_async(job_id, raw_output_file):
         send_feedback_prompt(job_id, telegram_user_id)
 
 
+def send_refined_versions_async(job_id, raw_output_file):
+    """ينشئ ويرسل النسختين المصححة والمحسنة تلقائياً مع ضمان تنظيف مجلد العمل."""
+    try:
+        _send_refined_versions_impl(job_id, raw_output_file)
+    finally:
+        cleanup_job_workdir(job_id)
+
+
 # ============================================================
 # الصفحة الرئيسية
 # ============================================================
@@ -4325,10 +4481,7 @@ def transcribe():
 
     job_id = str(uuid.uuid4())
 
-    work_dir = (
-        Path("/tmp")
-        / f"waqqad_{job_id}"
-    )
+    work_dir = get_work_dir(job_id)
 
     original_dir = (
         work_dir
@@ -4380,7 +4533,8 @@ def transcribe():
         job_id,
         process_transcription_job,
         job_id,
-        input_file
+        input_file,
+        user_id=telegram_user_id
     )
 
     return jsonify({
@@ -4424,7 +4578,8 @@ def transcribe_url():
         job_id,
         url,
         destination,
-        False
+        False,
+        user_id=telegram_user_id
     )
 
     return jsonify({
@@ -4473,6 +4628,19 @@ def deepgram_callback(job_id):
         return jsonify({
             "error": "unknown job"
         }), 404
+
+    # منع تنفيذ المهمة مرتين أو تضارب الحالات عند وصول Callback متأخر
+    current_status = job.get("status")
+    if current_status in ("completed", "failed"):
+        print(
+            f"[CALLBACK] Ignored late Deepgram callback for job {job_id} "
+            f"(current status: {current_status})",
+            flush=True
+        )
+        return jsonify({
+            "status": "ignored",
+            "reason": f"job already {current_status}"
+        }), 200
 
     try:
 
@@ -4752,6 +4920,12 @@ def refine_job(job_id):
     except Exception as e:
         print(f"[REFINE ERROR] job {job_id}: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
+
+
+try:
+    start_deepgram_reaper()
+except Exception as e:
+    print(f"[REAPER] Startup warning: {e}", flush=True)
 
 
 if __name__ == "__main__":
