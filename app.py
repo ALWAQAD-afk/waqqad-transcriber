@@ -18,6 +18,7 @@ from command_text import normalize_command_text
 from update_gate import SeenUpdates, is_stale_message
 import requests
 import concurrent.futures
+import diagnostics
 
 # --- إضافة التنقيح v3 - نظام 3 ملفات تلقائي + تقسيم دفعات ---
 try:
@@ -100,8 +101,20 @@ def cleanup_job_workdir(job_id):
         if work_dir.exists():
             shutil.rmtree(work_dir, ignore_errors=True)
             print(f"[CLEANUP] Removed workdir for job {job_id}", flush=True)
+        try:
+            collector = diagnostics.get_collector(job_id, create_if_missing=False)
+            if collector:
+                collector.record_cleanup(cleaned_up=True)
+        except Exception:
+            pass
     except Exception as e:
         print(f"[CLEANUP ERROR] Failed to clean workdir for job {job_id}: {e}", flush=True)
+        try:
+            collector = diagnostics.get_collector(job_id, create_if_missing=False)
+            if collector:
+                collector.record_cleanup(cleaned_up=False, error=str(e))
+        except Exception:
+            pass
 
 # مفتاح واحد أو عدة مفاتيح مفصولة بفواصل:
 # COHERE_API_KEYS=key1,key2,key3
@@ -1087,7 +1100,8 @@ def init_db():
                 );
             """)
             conn.commit()
-    print("[DB] Jobs, settings, blocked and feedback tables ready", flush=True)
+    diagnostics.init_table()
+    print("[DB] Jobs, settings, blocked, feedback and diagnostics tables ready", flush=True)
 
 
 YOUTUBE_COOKIES_KEY = "youtube_cookies"
@@ -1323,6 +1337,15 @@ def new_job_payload(
     original_url=None
 ):
     """بنية موحّدة للمهمة، سواء جاءت من الويب أو من المحادثة."""
+    try:
+        collector = diagnostics.get_collector(job_id)
+        collector.created_at = time.time()
+        collector.source = source
+        collector.original_filename = original_filename or "unknown"
+        collector.file_size_bytes = file_size or 0
+    except Exception:
+        pass
+
     return {
         "job_id": job_id,
         "status": "queued",
@@ -1417,6 +1440,7 @@ def _clean_parts_dir(parts_dir):
 
 def prepare_cohere_parts(job_id, input_file):
     """يجهّز قطع Cohere بأسرع مسار ممكن دون تغيير النص أو الصوت."""
+    t_split_start = time.time()
     work_dir = get_work_dir(job_id)
     parts_dir = work_dir / "cohere_parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
@@ -1447,6 +1471,16 @@ def prepare_cohere_parts(job_id, input_file):
             total_parts=1,
             prepare_mode="direct"
         )
+        try:
+            collector = diagnostics.get_collector(job_id)
+            parts_info = [{
+                "part_index": 1,
+                "size_bytes": file_size,
+                "filename": input_file.name,
+            }]
+            collector.record_audio_split(time.time() - t_split_start, 1, parts_info)
+        except Exception:
+            pass
         return [input_file]
 
     # 2) MP3 كبير: تقطيع بنسخ الضغط دون إعادة ترميز (سريع جداً).
@@ -1493,6 +1527,19 @@ def prepare_cohere_parts(job_id, input_file):
                     total_parts=len(parts),
                     prepare_mode="copy"
                 )
+                try:
+                    collector = diagnostics.get_collector(job_id)
+                    parts_info = [
+                        {
+                            "part_index": idx,
+                            "size_bytes": p.stat().st_size,
+                            "filename": p.name,
+                        }
+                        for idx, p in enumerate(parts, 1)
+                    ]
+                    collector.record_audio_split(time.time() - t_split_start, len(parts), parts_info)
+                except Exception:
+                    pass
                 return parts
 
             print(
@@ -1563,6 +1610,19 @@ def prepare_cohere_parts(job_id, input_file):
         total_parts=len(parts),
         prepare_mode="reencode"
     )
+    try:
+        collector = diagnostics.get_collector(job_id)
+        parts_info = [
+            {
+                "part_index": idx,
+                "size_bytes": p.stat().st_size,
+                "filename": p.name,
+            }
+            for idx, p in enumerate(parts, 1)
+        ]
+        collector.record_audio_split(time.time() - t_split_start, len(parts), parts_info)
+    except Exception:
+        pass
     return parts
 
 
@@ -2074,9 +2134,30 @@ def process_transcription_job(job_id, input_file):
     Deepgram يعمل فقط إذا كانت Cohere/مفاتيحها غير متاحة فعلًا.
     أخطاء FFmpeg/الملف/الطلب البرمجي تفشل المهمة ولا تحرق رصيد Deepgram.
     """
+    try:
+        collector = diagnostics.get_collector(job_id)
+        file_sz = input_file.stat().st_size if hasattr(input_file, "stat") and input_file.exists() else 0
+        collector.record_job_start(
+            filename=input_file.name if hasattr(input_file, "name") else str(input_file),
+            file_size=file_sz,
+            active_jobs=job_queue.running_count(),
+            waiting_jobs=job_queue.depth(),
+            concurrency_settings={
+                "cohere_concurrency": COHERE_CONCURRENCY,
+                "queue_workers": job_queue.WORKERS,
+            }
+        )
+    except Exception:
+        pass
+
     if not COHERE_API_KEYS:
         reason = "No Cohere API keys configured"
         print(f"[COHERE] {reason}; using Deepgram.", flush=True)
+        try:
+            collector = diagnostics.get_collector(job_id)
+            collector.record_fallback("deepgram", reason)
+        except Exception:
+            pass
         submit_to_deepgram(
             job_id,
             input_file,
@@ -2097,22 +2178,50 @@ def process_transcription_job(job_id, input_file):
 
         def _transcribe_worker(item):
             part_index, part_file = item
+            t_part0 = time.time()
+            part_size = part_file.stat().st_size if hasattr(part_file, "stat") and part_file.exists() else 0
             transcript_text, key_idx = cohere_transcribe_part(
                 job_id,
                 part_file,
                 part_index,
                 total_parts,
             )
+            t_part1 = time.time()
             with keys_lock:
                 used_keys.append(key_idx)
+            try:
+                collector = diagnostics.get_collector(job_id)
+                collector.record_part_request(
+                    part_index=part_index,
+                    duration_seconds=t_part1 - t_part0,
+                    part_size_bytes=part_size,
+                    chars_count=len(transcript_text.strip()),
+                    status="success",
+                    key_index=key_idx,
+                    started_at=t_part0,
+                    ended_at=t_part1,
+                )
+            except Exception:
+                pass
             return part_index, transcript_text.strip()
 
-        if total_parts <= 1 or COHERE_CONCURRENCY <= 1:
+        execution_mode = "parallel" if (total_parts > 1 and COHERE_CONCURRENCY > 1) else "sequential"
+        max_workers = min(total_parts, COHERE_CONCURRENCY) if execution_mode == "parallel" else 1
+        try:
+            collector = diagnostics.get_collector(job_id)
+            collector.record_cohere_plan(
+                actual_concurrency=max_workers,
+                max_concurrency=COHERE_CONCURRENCY,
+                execution_mode=execution_mode
+            )
+        except Exception:
+            pass
+
+        if execution_mode == "sequential":
             for index, part in enumerate(parts, start=1):
                 idx, text = _transcribe_worker((index, part))
                 transcripts_by_index[idx] = text
         else:
-            max_workers = min(total_parts, COHERE_CONCURRENCY)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
                     executor.submit(_transcribe_worker, (index, part))
@@ -2136,9 +2245,24 @@ def process_transcription_job(job_id, input_file):
             cohere_keys_used=sorted(set(used_keys))
         )
 
+        t_merge0 = time.time()
         final_text = "\n\n".join(
             t for t in ordered_transcripts if t
         )
+        t_merge1 = time.time()
+        try:
+            collector = diagnostics.get_collector(job_id)
+            is_order_verified = [
+                i for i in range(1, total_parts + 1) if transcripts_by_index.get(i)
+            ] == list(range(1, len(ordered_transcripts) + 1))
+            collector.record_merge(
+                duration_seconds=t_merge1 - t_merge0,
+                order_verified=is_order_verified,
+                final_chars_count=len(final_text),
+                final_words_count=len(final_text.split()),
+            )
+        except Exception:
+            pass
 
         if not final_text.strip():
             raise LocalProcessingError(
@@ -2175,6 +2299,12 @@ def process_transcription_job(job_id, input_file):
             flush=True
         )
 
+        try:
+            collector = diagnostics.get_collector(job_id)
+            collector.record_fallback("deepgram", reason)
+        except Exception:
+            pass
+
         update_job(
             job_id,
             status="processing",
@@ -2199,6 +2329,12 @@ def process_transcription_job(job_id, input_file):
             f"[LOCAL/REQUEST ERROR] Job {job_id}: {error}",
             flush=True
         )
+
+        try:
+            collector = diagnostics.get_collector(job_id)
+            collector.record_failure("error", e)
+        except Exception:
+            pass
 
         update_job(
             job_id,
@@ -2462,6 +2598,11 @@ def log_transcription_success(job_id):
         "✅ نجح"
     )
 
+    try:
+        diagnostics.finalize_diagnostic_success(job_id)
+    except Exception as e:
+        print(f"[DIAGNOSTIC LOG ERROR] {job_id}: {e}", flush=True)
+
 
 def log_transcription_failure(job_id):
     job = get_job(job_id) or {}
@@ -2489,6 +2630,16 @@ def log_transcription_failure(job_id):
         f"⚠️ السبب: {error}\n"
         f"🆔 المهمة: {job_id}"
     )
+
+    try:
+        diagnostics.finalize_diagnostic_failure(
+            job_id,
+            stage=job.get("stage"),
+            error=job.get("error"),
+            error_detail=job.get("error_detail")
+        )
+    except Exception as e:
+        print(f"[DIAGNOSTIC LOG ERROR] {job_id}: {e}", flush=True)
 
 
 CONTACT_INTRO = (
@@ -3638,12 +3789,23 @@ def run_url_job(job_id, url, destination, notify=True):
             print(f"[COOKIES] read failed: {e}", flush=True)
             cookies_text = None
 
+        t_dl0 = time.time()
         media_path, size, display_name = url_media.download_url(
             url,
             destination,
             MAX_URL_BYTES,
             cookies_text=cookies_text
         )
+        t_dl1 = time.time()
+        try:
+            collector = diagnostics.get_collector(job_id)
+            collector.record_audio_extraction(
+                method="url_download",
+                duration_seconds=t_dl1 - t_dl0,
+                audio_info={"size_bytes": size, "format": Path(media_path).suffix.lstrip(".")}
+            )
+        except Exception:
+            pass
 
         update_job(
             job_id,
@@ -3767,12 +3929,23 @@ def run_bot_job(job_id, attachment, destination):
 
     try:
         update_job(job_id, stage="downloading")
+        t_dl0 = time.time()
         size = download_telegram_file(
             TELEGRAM_BOT_TOKEN,
             attachment.get("file_id"),
             destination,
             MAX_UPLOAD_BYTES
         )
+        t_dl1 = time.time()
+        try:
+            collector = diagnostics.get_collector(job_id)
+            collector.record_audio_extraction(
+                method="bot_download",
+                duration_seconds=t_dl1 - t_dl0,
+                audio_info={"size_bytes": size, "format": destination.suffix.lstrip(".")}
+            )
+        except Exception:
+            pass
 
         update_job(job_id, stage="processing", file_size_bytes=size)
 
@@ -4022,6 +4195,7 @@ def _archive_transcript(job_id, text, job):
     if not TRANSCRIBER_LOG_CHAT_ID or not text.strip():
         return
 
+    t_arch0 = time.time()
     try:
         output_name = job.get("output_name") or "transcript.txt"
         name = f"{Path(output_name).stem}.txt"
@@ -4042,6 +4216,14 @@ def _archive_transcript(job_id, text, job):
     except Exception as e:
         # الأرشفة لا تُفشل التفريغ.
         print(f"[ARCHIVE ERROR] Job {job_id}: {e}", flush=True)
+    finally:
+        t_arch1 = time.time()
+        try:
+            collector = diagnostics.get_collector(job_id, create_if_missing=False)
+            if collector:
+                collector.record_archive(t_arch1 - t_arch0)
+        except Exception:
+            pass
 
 
 def _result_keyboard(job_id, kinds):
@@ -4718,6 +4900,31 @@ def job_status(job_id):
         }), 404
 
     return jsonify(job)
+
+
+@app.route(
+    "/diagnostic-log/<job_id>",
+    methods=["GET"]
+)
+def job_diagnostic_log(job_id):
+    try:
+        tg_user = _current_telegram_user()
+    except ValueError as auth_error:
+        return _unauthorized(auth_error)
+
+    job = get_job(job_id)
+    if job is None or not _job_belongs_to(job, tg_user):
+        return jsonify({
+            "error": "Job not found"
+        }), 404
+
+    diag = diagnostics.get_diagnostic_log(job_id)
+    if not diag:
+        return jsonify({
+            "error": "Diagnostic log not found"
+        }), 404
+
+    return jsonify(diag)
 
 
 # ============================================================
