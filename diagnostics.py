@@ -18,6 +18,47 @@ from typing import Any, Dict, List, Optional
 log = logging.getLogger("diagnostics")
 
 DIAGNOSTIC_LOG_CHAT_ID = os.environ.get("TRANSCRIBER_DIAGNOSTIC_LOG_CHAT_ID", "").strip()
+MAX_TELEGRAM_MESSAGE_CHARS = 3800
+
+_SENT_DIAGNOSTIC_JOBS = set()
+_SENT_LOCK = threading.Lock()
+
+
+def reset_sent_diagnostic_jobs():
+    """تفريغ سجل المهام المرسلة (مفيد للاختبارات)."""
+    with _SENT_LOCK:
+        _SENT_DIAGNOSTIC_JOBS.clear()
+
+
+def get_target_chat_ids() -> List[str]:
+    """استخراج معرفات القنوات المستهدفة دون تكرار.
+    تعتمد تلقائياً على TRANSCRIBER_LOG_CHAT_ID (قناة الأرشيف وسجلات التفريغ)،
+    وتقبل DIAGNOSTIC_LOG_CHAT_ID كقناة إضافية إن وُجدت واختلفت.
+    """
+    targets: List[str] = []
+    main_chat = None
+    try:
+        import app
+        main_chat = getattr(app, "TRANSCRIBER_LOG_CHAT_ID", None)
+    except Exception:
+        pass
+    if not main_chat:
+        main_chat = os.environ.get("TRANSCRIBER_LOG_CHAT_ID", "").strip()
+
+    if main_chat:
+        targets.append(str(main_chat).strip())
+
+    diag_chat = (
+        os.environ.get("TRANSCRIBER_DIAGNOSTIC_LOG_CHAT_ID")
+        or os.environ.get("DIAGNOSTIC_LOG_CHAT_ID")
+        or DIAGNOSTIC_LOG_CHAT_ID
+        or ""
+    ).strip()
+
+    if diag_chat and str(diag_chat) not in targets:
+        targets.append(str(diag_chat))
+
+    return targets
 
 # أنماط إخفاء الأسرار والمفاتيح والتوكنات
 _SECRET_PATTERNS = [
@@ -387,11 +428,9 @@ class JobDiagnosticCollector:
             if ap["split_duration_seconds"] is not None:
                 lines.append(f"  • التقسيم: {ap['parts_count']} أجزاء ({ap['split_duration_seconds']} ث)")
             if ap["parts"]:
-                for p in ap["parts"][:5]:
+                for p in ap["parts"]:
                     size_kb = round(p.get("size_bytes", 0) / 1024.0, 1)
                     lines.append(f"    - جزء {p.get('part_index')}: {size_kb} KB")
-                if len(ap["parts"]) > 5:
-                    lines.append(f"    - ... ({len(ap['parts']) - 5} أجزاء إضافية)")
 
         lines.append(f"⚙️ المحرك ({te['engine'] or 'غير معروف'}):")
         lines.append(
@@ -400,13 +439,11 @@ class JobDiagnosticCollector:
         lines.append(f"  • طلبات API: {te['api_requests_count']}")
 
         if te["parts_requests"]:
-            for req in te["parts_requests"][:5]:
-                key_str = f" | {req['key_index']}" if req.get("key_index") else ""
+            for req in te["parts_requests"]:
+                key_str = f" | المفتاح #{req['key_index']}" if req.get("key_index") is not None else ""
                 lines.append(
                     f"    - جزء {req['part_index']}: {req['duration_seconds']} ث | {req['chars_count']} حرف{key_str} [{req['status']}]"
                 )
-            if len(te["parts_requests"]) > 5:
-                lines.append(f"    - ... ({len(te['parts_requests']) - 5} طلبات إضافية)")
 
         if te["fallback_used"]:
             lines.append(f"  ⚠️ تحويل إلى {te['fallback_engine']}: {te['fallback_reason']}")
@@ -479,11 +516,103 @@ def init_table():
         log.warning("Could not initialize job_diagnostic_logs table: %s", e)
 
 
-def save_diagnostic_log(job_id: str, status: str, diag_data: dict, formatted_text: str):
+def send_diagnostic_telegram(job_id: str, formatted_text: str, original_filename: Optional[str] = None):
     """
-    حفظ السجل التشخيصي المفصل في قاعدة البيانات وإرساله إذا تم ضبط القناة.
-    لا يُلقي أي استثناءات مطلقاً لضمان عدم تأثر عملية التفريغ.
+    إرسال السجل التشخيصي إلى قناة الأرشيف تلقائياً بعد السجل المختصر.
+    - يُرسل تلقائياً إلى TRANSCRIBER_LOG_CHAT_ID (أو DIAGNOSTIC_LOG_CHAT_ID إن وُجدت).
+    - إذا كان السجل طويلاً (> 3800 حرفاً)، يُرسل كملف TXT بدلاً من رسالة نصية مع عنوان يتضمن معرف المهمة واسم الملف.
+    - يمنع التكرار (Idempotent) حتى عند إعادة محاولة الأرشفة أو الاستدعاء المتكرر.
+    - يمنع إرسال نسختين مكررتين إذا كانت DIAGNOSTIC_LOG_CHAT_ID مطابقة لـ TRANSCRIBER_LOG_CHAT_ID.
+    - آمن تماماً من الاستثناءات، ولا يؤثر على التفريغ أو الأرشفة إطلاقاً.
     """
+    if not job_id or not formatted_text:
+        return
+
+    # فحص منع التكرار
+    with _SENT_LOCK:
+        if job_id in _SENT_DIAGNOSTIC_JOBS:
+            log.info("Diagnostic log already sent to Telegram for job %s, skipping duplicate", job_id)
+            return
+        _SENT_DIAGNOSTIC_JOBS.add(job_id)
+
+    target_chats = get_target_chat_ids()
+    if not target_chats:
+        log.debug("No target chat configured for diagnostic logs (job %s)", job_id)
+        return
+
+    try:
+        import app
+        from pathlib import Path
+
+        filename = original_filename or "unknown"
+        stem = Path(filename).stem.strip() or "audio"
+        stem_clean = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", stem)
+        stem_clean = re.sub(r"\s+", " ", stem_clean).strip()
+        doc_filename = f"diagnostic_{job_id}_{stem_clean}.txt"
+
+        caption = (
+            "📋 سجل تفريغ تفصيلي (تشخيصي)\n"
+            f"📄 الملف: {filename}\n"
+            f"🆔 المهمة: {job_id}"
+        )
+
+        is_long = len(formatted_text) > MAX_TELEGRAM_MESSAGE_CHARS
+
+        for chat_id in target_chats:
+            try:
+                if is_long:
+                    # إرسال كملف TXT عبر send_document_bytes
+                    app.send_document_bytes(
+                        chat_id=chat_id,
+                        payload=formatted_text.encode("utf-8"),
+                        download_name=doc_filename,
+                        caption=caption,
+                        mime="text/plain; charset=utf-8"
+                    )
+                else:
+                    try:
+                        app.telegram_send_message(chat_id, formatted_text)
+                    except Exception as send_err:
+                        # إن فشل الإرسال كنص بسبب الطول غير المتوقع، أرسله كملف TXT
+                        err_str = str(send_err).lower()
+                        if "too long" in err_str or "400" in err_str:
+                            log.info("Falling back to document for diagnostic log (job %s) to %s", job_id, chat_id)
+                            app.send_document_bytes(
+                                chat_id=chat_id,
+                                payload=formatted_text.encode("utf-8"),
+                                download_name=doc_filename,
+                                caption=caption,
+                                mime="text/plain; charset=utf-8"
+                            )
+                        else:
+                            raise send_err
+            except Exception as e:
+                log.warning("Could not send diagnostic log for %s to chat %s: %s", job_id, chat_id, e)
+
+    except Exception as outer_err:
+        log.warning("send_diagnostic_telegram failed for %s: %s", job_id, outer_err)
+
+
+def save_diagnostic_log(
+    job_id: str,
+    status: str,
+    diag_data: dict,
+    formatted_text: str,
+    original_filename: Optional[str] = None
+):
+    """
+    حفظ السجل التشخيصي المفصل في قاعدة البيانات وإرساله إلى القنوات المستهدفة.
+    لا يُلقي أي استثناءات مطلقاً لضمان عدم تأثر عملية التفريغ أو الأرشفة.
+    """
+    filename = (
+        original_filename
+        or diag_data.get("job_info", {}).get("original_filename")
+    )
+
+    # 1. إرسال إلى تيليجرام
+    send_diagnostic_telegram(job_id, formatted_text, filename)
+
+    # 2. الحفظ في قاعدة البيانات
     try:
         from db import get_db_connection
         with get_db_connection() as conn:
@@ -504,14 +633,6 @@ def save_diagnostic_log(job_id: str, status: str, diag_data: dict, formatted_tex
     # طباعة ملخص في سجلات النظام
     log.info("Detailed Diagnostic Log for %s (%s):\n%s", job_id, status, formatted_text)
 
-    # إرسال اختياري لقناة تليجرام مخصصة للتشخيص إن وُجدت
-    if DIAGNOSTIC_LOG_CHAT_ID:
-        try:
-            import app
-            app.telegram_send_message(DIAGNOSTIC_LOG_CHAT_ID, formatted_text)
-        except Exception as e:
-            log.warning("Could not send diagnostic log to Telegram: %s", e)
-
 
 def finalize_diagnostic_success(job_id: str):
     """
@@ -523,14 +644,24 @@ def finalize_diagnostic_success(job_id: str):
         collector.record_success()
         diag_data = collector.to_dict()
         formatted_text = collector.format_report()
-        save_diagnostic_log(job_id, "completed", diag_data, formatted_text)
+        save_diagnostic_log(
+            job_id,
+            "completed",
+            diag_data,
+            formatted_text,
+        )
     except Exception as e:
         log.exception("Failed to finalize diagnostic success for %s: %s", job_id, e)
     finally:
         pop_collector(job_id)
 
 
-def finalize_diagnostic_failure(job_id: str, stage: str = None, error: Any = None, error_detail: Any = None):
+def finalize_diagnostic_failure(
+    job_id: str,
+    stage: str = None,
+    error: Any = None,
+    error_detail: Any = None
+):
     """
     إنهاء وحفظ السجل التشخيصي لمهمة فاشلة.
     آمن تماماً من الاستثناءات.
@@ -550,7 +681,12 @@ def finalize_diagnostic_failure(job_id: str, stage: str = None, error: Any = Non
         collector.record_failure(stage or collector.stage or "error", error, error_detail)
         diag_data = collector.to_dict()
         formatted_text = collector.format_report()
-        save_diagnostic_log(job_id, "failed", diag_data, formatted_text)
+        save_diagnostic_log(
+            job_id,
+            "failed",
+            diag_data,
+            formatted_text,
+        )
     except Exception as e:
         log.exception("Failed to finalize diagnostic failure for %s: %s", job_id, e)
     finally:

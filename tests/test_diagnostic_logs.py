@@ -24,6 +24,7 @@ import diagnostics
 class DiagnosticLogsTests(unittest.TestCase):
     def setUp(self):
         diagnostics._COLLECTORS.clear()
+        diagnostics.reset_sent_diagnostic_jobs()
         patcher = mock.patch.object(app, "COHERE_API_KEYS", ["cohere-key-1", "cohere-key-2"])
         self.addCleanup(patcher.stop)
         patcher.start()
@@ -47,14 +48,30 @@ class DiagnosticLogsTests(unittest.TestCase):
 
         patcher_tg = mock.patch.object(app, "telegram_send_message")
         self.addCleanup(patcher_tg.stop)
-        patcher_tg.start()
+        self.mock_tg = patcher_tg.start()
 
         patcher_doc = mock.patch.object(app, "send_document_bytes")
         self.addCleanup(patcher_doc.stop)
-        patcher_doc.start()
+        self.mock_doc = patcher_doc.start()
+
+        mock_conn = mock.MagicMock()
+        mock_conn.__enter__.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value.fetchone.return_value = None
+        patcher_db = mock.patch("db.get_db_connection", return_value=mock_conn)
+        self.addCleanup(patcher_db.stop)
+        patcher_db.start()
+
+        patcher_app_db = mock.patch.object(app, "get_db_connection", return_value=mock_conn)
+        self.addCleanup(patcher_app_db.stop)
+        patcher_app_db.start()
+
+        patcher_refine = mock.patch.object(app, "send_refined_versions_async")
+        self.addCleanup(patcher_refine.stop)
+        patcher_refine.start()
 
     def tearDown(self):
         diagnostics._COLLECTORS.clear()
+        diagnostics.reset_sent_diagnostic_jobs()
 
     def test_both_logs_created_on_success(self):
         """1. إنشاء النسختين (المختصرة والتفصيلية) للمهمة الناجحة."""
@@ -279,6 +296,193 @@ class DiagnosticLogsTests(unittest.TestCase):
                 data = res.get_json()
                 self.assertEqual(data["job_id"], job_id)
                 self.assertEqual(data["status"], "completed")
+
+    def test_telegram_two_separate_logs_sent_to_archive_channel(self):
+        """8. إرسال سجلين منفصلين إلى قناة الأرشيف: الأول مختصر والثاني تفصيلي."""
+        job_id = "job-two-logs"
+        archive_chat_id = "-100987654321"
+
+        parts = [Path("/tmp/p1.mp3"), Path("/tmp/p2.mp3")]
+
+        with mock.patch.object(app, "TRANSCRIBER_LOG_CHAT_ID", archive_chat_id), \
+             mock.patch.object(app, "prepare_cohere_parts", return_value=parts), \
+             mock.patch.object(app, "cohere_transcribe_part", return_value=("نص جزء", 1)), \
+             mock.patch.object(app, "update_job"), \
+             mock.patch.object(app, "COHERE_CONCURRENCY", 2), \
+             mock.patch.object(app, "_archive_transcript"):
+
+            app.new_job_payload(job_id, "audio_file.mp3", 1024, "55555", source="web")
+            app.process_transcription_job(job_id, Path("/tmp/audio.mp3"))
+
+        # يجب أن تُستدعى telegram_send_message مرتين على الأقل لقناة الأرشيف:
+        archive_calls = [
+            call for call in self.mock_tg.call_args_list
+            if str(call.args[0]) == str(archive_chat_id)
+        ]
+        self.assertGreaterEqual(len(archive_calls), 2, "يجب إرسال السجل المختصر ثم السجل التفصيلي لقناة الأرشيف")
+
+        # 1. السجل المختصر
+        brief_call = archive_calls[0]
+        brief_text = brief_call.args[1]
+        self.assertIn("📊 تفريغ مكتمل", brief_text)
+        self.assertIn("✅ نجح", brief_text)
+        self.assertIn(job_id, brief_text)
+
+        # 2. السجل التفصيلي التشخيصي
+        detailed_call = archive_calls[1]
+        detailed_text = detailed_call.args[1]
+        self.assertIn("🔍 سجل تشخيصي تفصيلي", detailed_text)
+        self.assertIn(job_id, detailed_text)
+        # التحقق من احتواء السجل على تفاصيل الأجزاء، توقيتاتها، ووضع التزامن
+        self.assertIn("تزامن", detailed_text)
+        self.assertIn("جزء", detailed_text)
+        self.assertIn("طلبات API", detailed_text)
+
+    def test_long_diagnostic_log_sent_as_txt_document(self):
+        """إرسال السجل التفصيلي كملف TXT عبر send_document_bytes إذا تجاوز الطول المسموح."""
+        job_id = "job-long-diag"
+        archive_chat_id = "-100123456789"
+        filename = "lecture_2026.mp3"
+
+        collector = diagnostics.get_collector(job_id)
+        collector.original_filename = filename
+        collector.created_at = time.time() - 100
+        collector.started_at = time.time() - 90
+        collector.record_audio_split(5.0, 90, [])
+
+        # محاكاة 90 جزءاً لجعل التقرير طويلاً جداً (> 3800 حرف)
+        for i in range(1, 91):
+            collector.record_part_request(
+                part_index=i,
+                duration_seconds=1.23,
+                part_size_bytes=45000,
+                chars_count=350,
+                status="success",
+                key_index=i % 3,
+                started_at=time.time() - 50,
+                ended_at=time.time() - 48
+            )
+
+        with mock.patch.object(app, "TRANSCRIBER_LOG_CHAT_ID", archive_chat_id):
+            diagnostics.finalize_diagnostic_success(job_id)
+
+        # التحقق من أن السجل أُرسل كملف TXT
+        self.assertTrue(self.mock_doc.called, "يجب استدعاء send_document_bytes عند طول التقرير")
+        doc_calls = [
+            call for call in self.mock_doc.call_args_list
+            if str(call.kwargs.get("chat_id") or call.args[0]) == str(archive_chat_id)
+        ]
+        self.assertGreaterEqual(len(doc_calls), 1)
+        doc_call = doc_calls[0]
+        kwargs = doc_call.kwargs if doc_call.kwargs else {}
+        args = doc_call.args
+
+        chat_id = kwargs.get("chat_id") or (args[0] if len(args) > 0 else None)
+        payload = kwargs.get("payload") or (args[1] if len(args) > 1 else None)
+        download_name = kwargs.get("download_name") or (args[2] if len(args) > 2 else None)
+        caption = kwargs.get("caption") or (args[3] if len(args) > 3 else "")
+
+        self.assertEqual(str(chat_id), str(archive_chat_id))
+        self.assertIn(job_id, download_name)
+        self.assertIn("lecture_2026", download_name)
+        self.assertTrue(download_name.endswith(".txt"))
+        self.assertIn(job_id, caption)
+        self.assertIn(filename, caption)
+
+        # محتوى الملف هو التقرير التشخيصي
+        content_text = payload.decode("utf-8")
+        self.assertIn("🔍 سجل تشخيصي تفصيلي", content_text)
+        self.assertIn(job_id, content_text)
+
+    def test_failure_sends_both_brief_and_detailed_logs(self):
+        """إرسال السجلين المختصر والتفصيلي عند فشل المهمة."""
+        job_id = "job-fail-delivery"
+        archive_chat_id = "-100123456789"
+
+        collector = diagnostics.get_collector(job_id)
+        collector.original_filename = "bad_audio.wav"
+        collector.created_at = time.time() - 10
+        collector.started_at = time.time() - 8
+
+        with mock.patch.object(app, "TRANSCRIBER_LOG_CHAT_ID", archive_chat_id):
+            app.log_transcription_failure(job_id)
+
+        archive_calls = [
+            call for call in self.mock_tg.call_args_list
+            if str(call.args[0]) == str(archive_chat_id)
+        ]
+        self.assertGreaterEqual(len(archive_calls), 2, "يجب إرسال السجلين المختصر والتفصيلي عند الفشل")
+
+        # 1. مختصر الفشل
+        brief_text = archive_calls[0].args[1]
+        self.assertIn("❌ فشل تفريغ", brief_text)
+
+        # 2. تفصيلي الفشل
+        detailed_text = archive_calls[1].args[1]
+        self.assertIn("🔍 سجل تشخيصي تفصيلي", detailed_text)
+        self.assertIn("❌ تفاصيل الخطأ", detailed_text)
+
+    def test_idempotent_no_duplicate_on_retry(self):
+        """عدم تكرار إرسال السجل التفصيلي عند إعادة محاولة الأرشفة أو الاستدعاء المتكرر."""
+        job_id = "job-idempotent-test"
+        archive_chat_id = "-100123456789"
+
+        with mock.patch.object(app, "TRANSCRIBER_LOG_CHAT_ID", archive_chat_id):
+            diagnostics.send_diagnostic_telegram(job_id, "تقرير تشخيصي تجريبي", "test.mp3")
+            count_after_first = self.mock_tg.call_count
+
+            # محاكاة إعادة المحاولة
+            diagnostics.send_diagnostic_telegram(job_id, "تقرير تشخيصي تجريبي", "test.mp3")
+            count_after_retry = self.mock_tg.call_count
+
+        self.assertEqual(count_after_first, 1)
+        self.assertEqual(count_after_retry, 1, "يجب عدم إرسال السجل التشخيصي مرة أخرى لنفس المهمة")
+
+    def test_deduplication_when_diagnostic_chat_equals_transcriber_chat(self):
+        """عدم إرسال نسختين مكررتين عند تطابق DIAGNOSTIC_LOG_CHAT_ID مع TRANSCRIBER_LOG_CHAT_ID."""
+        same_chat_id = "-100111222333"
+
+        with mock.patch.object(app, "TRANSCRIBER_LOG_CHAT_ID", same_chat_id), \
+             mock.patch.dict(os.environ, {"TRANSCRIBER_DIAGNOSTIC_LOG_CHAT_ID": same_chat_id}):
+
+            targets = diagnostics.get_target_chat_ids()
+            self.assertEqual(targets, [same_chat_id], "يجب ألا يحتوي الهدف على قنوات مكررة")
+
+            diagnostics.send_diagnostic_telegram("job-dedup-chat", "محتوى التقرير", "audio.mp3")
+
+        calls = [c for c in self.mock_tg.call_args_list if str(c.args[0]) == same_chat_id]
+        self.assertEqual(len(calls), 1, "يجب إرسال نسخة واحدة فقط عند تطابق القناتين")
+
+    def test_distinct_chats_when_diagnostic_chat_is_different(self):
+        """إرسال السجل لكل قناة مستهدفة بدون تكرار عند اختلاف القناتين."""
+        archive_chat = "-100111"
+        diagnostic_chat = "-100222"
+
+        with mock.patch.object(app, "TRANSCRIBER_LOG_CHAT_ID", archive_chat), \
+             mock.patch.dict(os.environ, {"TRANSCRIBER_DIAGNOSTIC_LOG_CHAT_ID": diagnostic_chat}):
+
+            targets = diagnostics.get_target_chat_ids()
+            self.assertEqual(set(targets), {archive_chat, diagnostic_chat})
+
+            diagnostics.send_diagnostic_telegram("job-distinct-chat", "محتوى التقرير", "audio.mp3")
+
+        call_chats = [str(c.args[0]) for c in self.mock_tg.call_args_list]
+        self.assertIn(archive_chat, call_chats)
+        self.assertIn(diagnostic_chat, call_chats)
+        self.assertEqual(call_chats.count(archive_chat), 1)
+        self.assertEqual(call_chats.count(diagnostic_chat), 1)
+
+    def test_send_failure_does_not_affect_transcription(self):
+        """فشل إرسال السجل التشخيصي لتيليجرام لا يعطل إتمام المهمة."""
+        self.mock_tg.side_effect = RuntimeError("Telegram Network Timeout")
+        self.mock_doc.side_effect = RuntimeError("Telegram Network Timeout")
+
+        with mock.patch.object(app, "TRANSCRIBER_LOG_CHAT_ID", "-100123"):
+            try:
+                diagnostics.send_diagnostic_telegram("job-failing-tg", "نص التقرير", "audio.mp3")
+                app.log_transcription_success("job-failing-tg")
+            except Exception as e:
+                self.fail(f"يجب ألا يُلقي أي استثناء عند فشل تيليجرام: {e}")
 
 
 if __name__ == "__main__":
