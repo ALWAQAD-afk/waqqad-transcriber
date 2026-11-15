@@ -336,3 +336,31 @@ def overall_stats():
     except Exception as exc:
         log.warning("Overall stats failed: %s", exc)
         return {}
+
+
+def count_raw_excluding(exclude_user_id=None):
+    """عدد التفريغات الخام، مع إمكانية استثناء مستخدم واحد.
+
+    ``None`` تعني تعذّر القراءة لا صفرًا، حتى تفرّق الرسالة بين «لا توجد
+    تفريغات» و«قاعدة البيانات غير متاحة».
+    """
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                if exclude_user_id is None:
+                    cur.execute("""
+                        SELECT COUNT(*) AS total
+                        FROM transcripts
+                        WHERE kind = 'raw'
+                    """)
+                else:
+                    cur.execute("""
+                        SELECT COUNT(*) AS total
+                        FROM transcripts
+                        WHERE kind = 'raw' AND user_id <> %s
+                    """, (int(exclude_user_id),))
+                row = cur.fetchone() or {}
+                return int(row.get("total") or 0)
+    except Exception as exc:
+        log.warning("Raw transcript count failed: %s", exc)
+        return None

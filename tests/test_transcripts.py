@@ -82,5 +82,70 @@ class TestBuildSearchTerms(unittest.TestCase):
         self.assertEqual(len(terms), 2)
 
 
+class _FakeCursor:
+    def __init__(self, row):
+        self.row = row
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
+
+    def fetchone(self):
+        return self.row
+
+
+class _FakeConnection:
+    def __init__(self, row):
+        self.cursor_obj = _FakeCursor(row)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cursor(self):
+        return self.cursor_obj
+
+
+class TestCountRawExcluding(unittest.TestCase):
+    def setUp(self):
+        self.original = transcripts._connect
+
+    def tearDown(self):
+        transcripts._connect = self.original
+
+    def test_excludes_requesting_user(self):
+        conn = _FakeConnection({"total": 7})
+        transcripts._connect = lambda: conn
+
+        self.assertEqual(transcripts.count_raw_excluding(42), 7)
+        sql, params = conn.cursor_obj.calls[-1]
+        self.assertIn("user_id <> %s", sql)
+        self.assertEqual(params, (42,))
+
+    def test_without_exclusion_counts_everyone(self):
+        conn = _FakeConnection({"total": 9})
+        transcripts._connect = lambda: conn
+
+        self.assertEqual(transcripts.count_raw_excluding(), 9)
+        sql, params = conn.cursor_obj.calls[-1]
+        self.assertNotIn("user_id <>", sql)
+        self.assertIsNone(params)
+
+    def test_failure_returns_none_not_zero(self):
+        def boom():
+            raise RuntimeError("db down")
+
+        transcripts._connect = boom
+        self.assertIsNone(transcripts.count_raw_excluding(42))
+
+
 if __name__ == "__main__":
     unittest.main()
