@@ -50,6 +50,7 @@ from werkzeug.utils import secure_filename
 import job_queue
 import transcripts as transcript_store
 import url_media
+import broadcast as broadcast_util
 from bot_upload import (
     DownloadFailed,
     FileTooLarge,
@@ -233,6 +234,7 @@ FEEDBACK_VERDICTS = {
 DEVELOPER_ONLY_COMMANDS = [
     {"command": "stats", "description": "إحصاءات الخدمة"},
     {"command": "summary", "description": "أرقام مختصرة: المستخدمون والتفريغات"},
+    {"command": "broadcast", "description": "مراسلة كل المستخدمين مرة واحدة"},
     {"command": "users", "description": "آخر 20 مستخدمًا"},
     {"command": "allusers", "description": "كل المستخدمين من التأسيس"},
     {"command": "cookies", "description": "حالة كوكيز يوتيوب"},
@@ -596,6 +598,276 @@ def forward_outreach_reply(chat_id, user_id, sender, message):
     return True
 
 
+def _mark_broadcast_draft(user_id):
+    with _BROADCAST_LOCK:
+        _BROADCAST_DRAFT[str(user_id)] = time.time()
+
+
+def _consume_broadcast_draft(user_id):
+    """يعيد True إن كان المطوّر ينتظر كتابة نص المراسلة الجماعية."""
+    key = str(user_id)
+    with _BROADCAST_LOCK:
+        started = _BROADCAST_DRAFT.pop(key, None)
+    if started is None:
+        return False
+    return time.time() - started <= BROADCAST_INPUT_SECONDS
+
+
+def _clear_broadcast_draft(user_id):
+    with _BROADCAST_LOCK:
+        _BROADCAST_DRAFT.pop(str(user_id), None)
+
+
+def _broadcast_recipients(exclude_user_id):
+    """مستخدمو البوت المميّزون، بلا حساب الطالب وبلا المحجوبين."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT j.data->>'telegram_user_id' AS user_id
+                FROM jobs j
+                WHERE j.data->>'telegram_user_id' IS NOT NULL
+                  AND j.data->>'telegram_user_id' <> ''
+                  AND j.data->>'telegram_user_id' <> %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM blocked_users b
+                      WHERE b.user_id = j.data->>'telegram_user_id'
+                  )
+                ORDER BY user_id
+            """, (str(exclude_user_id),))
+            rows = cur.fetchall()
+
+    recipients = []
+    for row in rows:
+        user_id = str(row.get("user_id") or "").strip()
+        if user_id:
+            recipients.append(user_id)
+    return list(dict.fromkeys(recipients))
+
+
+def _broadcast_preview(chat_id, user_id, text):
+    """يعرض المراسلة ويعطي المطوّر زر تأكيد قبل الإرسال الفعلي."""
+    try:
+        text = broadcast_util.clean_text(text)
+    except ValueError as error:
+        telegram_send_message(chat_id, f"⚠️ {error}")
+        return
+
+    try:
+        recipients = _broadcast_recipients(user_id)
+    except Exception as e:
+        print(f"[BROADCAST] recipients query failed: {e}", flush=True)
+        telegram_send_message(
+            chat_id,
+            "⚠️ تعذّر قراءة المستخدمين من قاعدة البيانات. حاول بعد قليل."
+        )
+        return
+
+    if not recipients:
+        telegram_send_message(
+            chat_id,
+            "لا يوجد مستخدمون مسجّلون لإرسال الرسالة إليهم."
+        )
+        return
+
+    token = uuid.uuid4().hex[:12]
+    with _BROADCAST_LOCK:
+        now = time.time()
+        # تنظيف المسودات القديمة حتى لا تتراكم في الذاكرة.
+        for old_token, entry in list(_BROADCAST_PENDING.items()):
+            if now - entry.get("created_at", 0) > BROADCAST_CONFIRM_SECONDS:
+                _BROADCAST_PENDING.pop(old_token, None)
+        _BROADCAST_PENDING[token] = {
+            "text": text,
+            "recipients": recipients,
+            "created_at": now,
+        }
+
+    preview = text if len(text) <= 1200 else text[:1200] + "…"
+    telegram_send_message(
+        chat_id,
+        "📣 مراجعة المراسلة الجماعية\n\n"
+        f"{preview}\n\n"
+        f"👥 المستلمون: {len(recipients)}\n"
+        "بدون حسابك والمحجوبين.\n\n"
+        "⚠️ بعد التأكيد لا يمكن التراجع؛ ستُرسل كل رسالة على انفراد.",
+        reply_markup={
+            "inline_keyboard": [[
+                {
+                    "text": "✅ إرسال الآن",
+                    "callback_data": f"bc:yes:{token}",
+                },
+                {
+                    "text": "❌ إلغاء",
+                    "callback_data": f"bc:no:{token}",
+                },
+            ]]
+        }
+    )
+
+
+def handle_broadcast_command(chat_id, user_id, argument):
+    """‏/broadcast <نص> أو /broadcast ثم النص في الرسالة التالية."""
+    if not is_developer(user_id):
+        telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
+        return
+
+    if argument:
+        _clear_broadcast_draft(user_id)
+        _broadcast_preview(chat_id, user_id, argument)
+        return
+
+    _mark_broadcast_draft(user_id)
+    telegram_send_message(
+        chat_id,
+        "📣 اكتب نص الرسالة الجماعية في الرسالة التالية.\n"
+        "ستظهر لك معاينة وعدد المستلمين قبل أي إرسال.\n\n"
+        "أو استخدم: /broadcast <النص>\n"
+        "للإلغاء: /cancel"
+    )
+
+
+def _broadcast_send(target, text):
+    telegram_send_message(target, text, quiet=True)
+
+
+def _run_broadcast(chat_id, message_id, entry):
+    """يرسل في خيط خلفي، ويحدّث رسالة التقدم كل بضع ثوانٍ."""
+    global _BROADCAST_RUNNING
+
+    started = time.time()
+    last_update = [0.0]
+
+    def on_progress(done, sent, failed, total):
+        now = time.time()
+        if done < total and now - last_update[0] < 5:
+            return
+        last_update[0] = now
+        telegram_edit_message(
+            chat_id,
+            message_id,
+            "📣 المراسلة جارية…\n"
+            f"✅ أُرسلت: {sent}\n"
+            f"❌ تعذّر: {failed}\n"
+            f"📨 من أصل: {total}"
+        )
+
+    try:
+        result = broadcast_util.send_all(
+            entry.get("recipients") or [],
+            entry.get("text") or "",
+            _broadcast_send,
+            on_progress=on_progress,
+        )
+    except Exception as e:
+        print(f"[BROADCAST] unexpected failure: {e}", flush=True)
+        telegram_edit_message(
+            chat_id,
+            message_id,
+            "⚠️ توقفت المراسلة بسبب خطأ غير متوقع. "
+            "راجع سجلات الخادم."
+        )
+        return
+    finally:
+        with _BROADCAST_RUN_LOCK:
+            _BROADCAST_RUNNING = False
+
+    print(
+        f"[BROADCAST] finished total={result['total']} "
+        f"sent={result['sent']} failed={result['failed']}",
+        flush=True
+    )
+    telegram_edit_message(
+        chat_id,
+        message_id,
+        "✅ اكتملت المراسلة الجماعية.\n"
+        f"✅ أُرسلت: {result['sent']}\n"
+        f"❌ تعذّر: {result['failed']}\n"
+        f"📨 المجموع: {result['total']}\n"
+        f"⏱️ المدة: {_format_duration(time.time() - started)}"
+    )
+
+
+def _handle_broadcast_callback(callback_id, data, user_id, chat_id, message_id):
+    """زرّا التأكيد والإلغاء لمراسلة جماعية معلّقة."""
+    global _BROADCAST_RUNNING
+
+    if not is_developer(user_id):
+        answer_callback(callback_id, "هذا الأمر للمطوّر فقط", alert=True)
+        return
+
+    try:
+        _, action, token = data.split(":", 2)
+    except ValueError:
+        answer_callback(callback_id, "خيار غير صالح", alert=True)
+        return
+
+    with _BROADCAST_LOCK:
+        entry = _BROADCAST_PENDING.pop(token, None)
+
+    if not entry:
+        answer_callback(
+            callback_id,
+            "انتهت صلاحية هذه المراسلة. أعد /broadcast.",
+            alert=True
+        )
+        telegram_edit_message(
+            chat_id,
+            message_id,
+            "⌛ انتهت صلاحية هذه المراسلة. أعد /broadcast."
+        )
+        return
+
+    if time.time() - entry.get("created_at", 0) > BROADCAST_CONFIRM_SECONDS:
+        answer_callback(callback_id, "انتهت الصلاحية", alert=True)
+        telegram_edit_message(
+            chat_id,
+            message_id,
+            "⌛ انتهت صلاحية هذه المراسلة. أعد /broadcast."
+        )
+        return
+
+    if action == "no":
+        answer_callback(callback_id, "أُلغيت المراسلة")
+        telegram_edit_message(
+            chat_id,
+            message_id,
+            "❌ أُلغيت المراسلة الجماعية. لم تُرسل أي رسالة."
+        )
+        return
+
+    if action != "yes":
+        answer_callback(callback_id, "خيار غير معروف", alert=True)
+        return
+
+    with _BROADCAST_RUN_LOCK:
+        if _BROADCAST_RUNNING:
+            # لا نُهدر المسودة: نعيدها كي يستطيع المطوّر تأكيدها بعد انتهاء
+            # المراسلة الجارية.
+            with _BROADCAST_LOCK:
+                _BROADCAST_PENDING[token] = entry
+            answer_callback(
+                callback_id,
+                "هناك مراسلة جماعية قيد التنفيذ الآن",
+                alert=True
+            )
+            return
+        _BROADCAST_RUNNING = True
+
+    answer_callback(callback_id, "بدأ الإرسال")
+    telegram_edit_message(
+        chat_id,
+        message_id,
+        f"⏳ جارٍ الإرسال إلى {len(entry.get('recipients') or [])} مستخدمًا…"
+    )
+    threading.Thread(
+        target=_run_broadcast,
+        args=(chat_id, message_id, entry),
+        name="broadcast",
+        daemon=True,
+    ).start()
+
+
 def handle_allusers(chat_id, user_id):
     """كل مستخدم استخدم البوت من التأسيس، للمطوّر فقط."""
     if not is_developer(user_id):
@@ -825,6 +1097,16 @@ _YTINFO_PENDING = {}
 _YTINFO_RUNNING = set()
 _YTINFO_LOCK = threading.Lock()
 YTINFO_WINDOW_SECONDS = 5 * 60
+
+# المراسلة الجماعية: مسودة يكتبها المطوّر ثم يؤكدها بزر، ولا تُرسل بلمسة
+# واحدة حتى لا تصل رسالة خاطئة إلى كل المستخدمين.
+_BROADCAST_DRAFT = {}
+_BROADCAST_PENDING = {}
+_BROADCAST_LOCK = threading.Lock()
+_BROADCAST_RUN_LOCK = threading.Lock()
+_BROADCAST_RUNNING = False
+BROADCAST_INPUT_SECONDS = 10 * 60
+BROADCAST_CONFIRM_SECONDS = 10 * 60
 
 # تيليجرام يعيد إرسال التحديث نفسه إذا لم يصل الردّ بسرعة. أوامر ثقيلة
 # مثل /allusers كانت تجعل الحلقة تدور وتحجب كل الأوامر التالية.
@@ -2363,8 +2645,13 @@ def transcript_download_name(original_filename):
     return f"{stem}.txt"
 
 
-def telegram_send_message(chat_id, text, reply_markup=None, parse_mode=None):
-    """Send a normal Telegram message from the transcriber bot."""
+def telegram_send_message(chat_id, text, reply_markup=None, parse_mode=None,
+                          quiet=False):
+    """Send a normal Telegram message from the transcriber bot.
+
+    ``quiet`` يمنع سجل النجاح فقط (يُستخدم في المراسلة الجماعية حتى لا
+    يمتلئ السجل بآلاف الأسطر)، بينما تُسجَّل الأخطاء دائمًا.
+    """
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
 
@@ -2385,15 +2672,22 @@ def telegram_send_message(chat_id, text, reply_markup=None, parse_mode=None):
         data=payload,
         timeout=30
     )
-    print(
-        f"[TRANSCRIBER CHAT] Telegram HTTP {response.status_code}: "
-        f"{response.text[:500]}",
-        flush=True
-    )
+    if not quiet:
+        print(
+            f"[TRANSCRIBER CHAT] Telegram HTTP {response.status_code}: "
+            f"{response.text[:500]}",
+            flush=True
+        )
 
     data = response.json() if response.content else {}
 
     if response.status_code != 200 or not data.get("ok"):
+        if quiet:
+            print(
+                f"[TRANSCRIBER CHAT] Telegram HTTP {response.status_code}: "
+                f"{response.text[:300]}",
+                flush=True
+            )
         raise RuntimeError(
             f"Telegram sendMessage HTTP {response.status_code}: "
             f"{response.text[:300]}"
@@ -3505,6 +3799,12 @@ def handle_transcriber_chat_update(update):
         _forward_contact(chat_id, user_id, sender, raw_text)
         return
 
+    # بعد /broadcast بلا نص: الرسالة التالية هي نص المراسلة الجماعية.
+    if is_developer(user_id) and raw_text and not raw_text.startswith("/"):
+        if _consume_broadcast_draft(user_id):
+            _broadcast_preview(chat_id, user_id, raw_text)
+            return
+
     # بعد /ytinfo بلا رابط: الرابط التالي يُفحص بدل إنشاء مهمة تفريغ.
     if is_developer(user_id) and raw_text and not raw_text.startswith("/"):
         if _consume_pending_ytinfo(user_id):
@@ -3544,12 +3844,13 @@ def handle_transcriber_chat_update(update):
     command = parts[0].split("@", 1)[0].lower() if parts else ""
     argument = parts[1].strip() if len(parts) > 1 else ""
 
-    # أي أمر آخر ينهي وضع كتابة رسالة تواصل أو رسالة مُوجَّهة للمطوّر.
-    if command not in ("/contact", "/msg"):
-        with _CONTACT_LOCK:
-            _CONTACT_PENDING.pop(str(user_id), None)
-        _clear_pending_outreach(user_id)
-        _clear_pending_ytinfo(user_id)
+    # أي أمر جديد ينهي أوضاع الكتابة السابقة؛ الأوامر التي تحتاج وضعًا
+    # تُعيد تفعيله بنفسها بعد هذا التنظيف.
+    with _CONTACT_LOCK:
+        _CONTACT_PENDING.pop(str(user_id), None)
+    _clear_pending_outreach(user_id)
+    _clear_pending_ytinfo(user_id)
+    _clear_broadcast_draft(user_id)
 
     keyboard = {
         "inline_keyboard": [[{
@@ -3613,6 +3914,9 @@ def handle_transcriber_chat_update(update):
         return
     elif command == "/summary":
         handle_summary(chat_id, user_id)
+        return
+    elif command == "/broadcast":
+        handle_broadcast_command(chat_id, user_id, argument)
         return
     elif command == "/users":
         threading.Thread(
@@ -4335,6 +4639,16 @@ def handle_transcriber_callback(update):
     ):
         handle_blocked_gate(user_id)
         answer_callback(callback_id, "تم إيقاف استخدامك لهذه الخدمة", alert=True)
+        return
+
+    if data.startswith("bc:"):
+        _handle_broadcast_callback(
+            callback_id,
+            data,
+            user_id,
+            chat_id,
+            message.get("message_id"),
+        )
         return
 
     if data.startswith("fb:"):
