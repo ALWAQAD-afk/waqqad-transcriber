@@ -232,6 +232,7 @@ FEEDBACK_VERDICTS = {
 
 DEVELOPER_ONLY_COMMANDS = [
     {"command": "stats", "description": "إحصاءات الخدمة"},
+    {"command": "summary", "description": "أرقام مختصرة: المستخدمون والتفريغات"},
     {"command": "users", "description": "آخر 20 مستخدمًا"},
     {"command": "allusers", "description": "كل المستخدمين من التأسيس"},
     {"command": "cookies", "description": "حالة كوكيز يوتيوب"},
@@ -2936,6 +2937,42 @@ def handle_users(chat_id, user_id):
         )
 
 
+def _count_users():
+    """عدد المستخدمين المميّزين في سجل المهام، أو None عند الفشل."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(DISTINCT data->>'telegram_user_id') AS users
+                    FROM jobs
+                    WHERE data->>'telegram_user_id' IS NOT NULL
+                      AND data->>'telegram_user_id' <> ''
+                """)
+                row = cur.fetchone() or {}
+                return int(row.get("users") or 0)
+    except Exception as e:
+        print(f"[SUMMARY] users query failed: {e}", flush=True)
+        return None
+
+
+def handle_summary(chat_id, user_id):
+    """أرقام مختصرة للمطوّر: عدد المستخدمين، والتفريغات بلا حسابه."""
+    if not is_developer(user_id):
+        telegram_send_message(chat_id, "هذا الأمر للمطوّر فقط.")
+        return
+
+    users = _count_users()
+    others = transcript_store.count_raw_excluding(user_id)
+
+    users_text = str(users) if users is not None else "غير متاح مؤقتًا"
+    others_text = str(others) if others is not None else "غير متاح مؤقتًا"
+    telegram_send_message(
+        chat_id,
+        f"👥 عدد المستخدمين: {users_text}\n"
+        f"🗂️ عدد التفريغات (من غيرك): {others_text}"
+    )
+
+
 def handle_stats(chat_id, user_id):
     """لوحة أرقام للمطوّر فقط، من قاعدة البيانات والطابور."""
     if not is_developer(user_id):
@@ -3573,6 +3610,9 @@ def handle_transcriber_chat_update(update):
         reply = "أُلغي وضع كتابة الرسالة."
     elif command == "/stats":
         handle_stats(chat_id, user_id)
+        return
+    elif command == "/summary":
+        handle_summary(chat_id, user_id)
         return
     elif command == "/users":
         threading.Thread(
