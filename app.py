@@ -1,4 +1,5 @@
 import os
+import io
 import uuid
 import json
 import threading
@@ -86,6 +87,52 @@ CORS(
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TMP_DIR = Path(os.environ.get("TMPDIR", "/tmp"))
+
+
+def _truthy(value, default=False):
+    """قراءة رايات البيئة بصيغة متسامحة (1/true/yes/on)."""
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+# ============================================================
+# مسار التشغيل: Modal هو الأساس، وRender طوارئ لا تُستدعى إلا عند الفشل
+# ============================================================
+MODAL_RUNTIME = _truthy(os.environ.get("WAQQAD_MODAL_MODE"), False)
+MODAL_WORKER = _truthy(os.environ.get("WAQQAD_MODAL_WORKER"), False)
+MODAL_DISPATCH_ENABLED = (
+    MODAL_RUNTIME
+    and not _truthy(os.environ.get("WAQQAD_DISABLE_MODAL_DISPATCH"), False)
+)
+
+RENDER_FALLBACK_URL = (
+    os.environ.get("RENDER_FALLBACK_URL", "").strip().rstrip("/")
+)
+RENDER_FALLBACK_ENABLED = _truthy(
+    os.environ.get("RENDER_FALLBACK_ENABLED"),
+    default=bool(RENDER_FALLBACK_URL),
+)
+RENDER_FALLBACK_SECRET = os.environ.get(
+    "RENDER_FALLBACK_SECRET", ""
+).strip()
+RENDER_FALLBACK_TIMEOUT = float(
+    os.environ.get("RENDER_FALLBACK_TIMEOUT", "180") or 180
+)
+# راية تُضبط على خدمة Render الاحتياطية فقط: تمنع فحص المهام المعلقة
+# عند الإقلاع كي لا تُعلَّم مهام Modal النشطة بالفشل.
+RENDER_FALLBACK_MODE = (
+    _truthy(os.environ.get("WAQQAD_RENDER_FALLBACK_MODE"), False)
+    or _truthy(os.environ.get("WAQQAD_DISABLE_MODAL_DISPATCH"), False)
+)
+
+
+def _render_fallback_ready():
+    return bool(
+        RENDER_FALLBACK_ENABLED
+        and RENDER_FALLBACK_URL
+        and RENDER_FALLBACK_SECRET
+    )
 
 
 def get_work_dir(job_id):
@@ -1468,10 +1515,20 @@ def cleanup_stale_workdirs():
         print(f"[CLEANUP] Removed {removed} stale work dirs", flush=True)
 
 
-# تهيئة الجدول عند بدء التشغيل
+# تهيئة الجدول عند بدء التشغيل.
+# على Modal قد تعمل عدة حاويات (ويب + عاملات)؛ لا يجوز أن يعلّم إقلاع
+# إحداها مهام الحاويات الأخرى بالفشل. لذلك يُتخطى فحص المهام المعلقة في
+# وضع Modal وفي وضع Render الاحتياطي، ويبقى في التشغيل المحلي/Render الأساسي.
 try:
     init_db()
-    fail_orphaned_jobs()
+    if not (MODAL_RUNTIME or RENDER_FALLBACK_MODE):
+        fail_orphaned_jobs()
+    else:
+        print(
+            "[DB] Orphan sweep skipped for multi-container runtime "
+            f"(modal={MODAL_RUNTIME}, render_fallback={RENDER_FALLBACK_MODE})",
+            flush=True,
+        )
 except Exception as e:
     print(f"[DB] Warning: could not initialize table: {e}", flush=True)
 finally:
@@ -1495,6 +1552,25 @@ if not TELEGRAM_WEBHOOK_SECRET or not WARRAQ_WEBHOOK_SECRET:
         "[SECURITY] Webhook secrets are not fully configured. "
         "Set TELEGRAM_WEBHOOK_SECRET and WARRAQ_WEBHOOK_SECRET.",
         flush=True
+    )
+
+if MODAL_RUNTIME:
+    print(
+        "[RUNTIME] Modal primary mode enabled; "
+        f"render_fallback={'configured' if _render_fallback_ready() else 'disabled'}",
+        flush=True,
+    )
+    if RENDER_FALLBACK_ENABLED and not _render_fallback_ready():
+        print(
+            "[RUNTIME] Render fallback is enabled but incomplete: "
+            "set RENDER_FALLBACK_URL and RENDER_FALLBACK_SECRET.",
+            flush=True,
+        )
+elif RENDER_FALLBACK_MODE:
+    print(
+        "[RUNTIME] Render emergency receiver mode; "
+        "Modal dispatch disabled on this service.",
+        flush=True,
     )
 
 # أزرار التصدير لا تعمل إن لم تكن callback_query ضمن allowed_updates.
@@ -1656,6 +1732,421 @@ def new_job_payload(
         "telegram_error": None,
         "source": source,
     }
+
+
+# ============================================================
+# توزيع المهام الثقيلة: Modal أولاً، وRender احتياطي عند الفشل الكامل فقط
+# ============================================================
+#
+# قواعد صارمة:
+# - لا تُرسل أي مهمة إلى Render ما دام استدعاء Modal قد نجح، حتى لو كان
+#   الملف دقيقة واحدة. لا يوجد أي شرط على المدة أو الحجم هنا.
+# - Render لا يُجرَّب إلا بعد استثناء اتصال/مهلة/فشل في تشغيل دالة Modal
+#   أو تعطّل نقطة الاستقبال نفسها.
+# - إن لم يُضبط RENDER_FALLBACK_URL (أو فشل هو أيضًا) تُعلَّم المهمة فاشلة
+#   برسالة واضحة، ويُحذف مجلد العمل المؤقت في جميع الحالات.
+
+def _post_render_fallback(
+    kind,
+    job_id,
+    user_id,
+    *,
+    file_path=None,
+    attachment=None,
+    url=None,
+    notify=True,
+    transcript=None,
+):
+    """إرسال مهمة إلى خدمة Render الاحتياطية عبر endpoint محمي بسر."""
+    if not _render_fallback_ready():
+        raise RuntimeError(
+            "Render fallback is not configured "
+            "(RENDER_FALLBACK_URL/RENDER_FALLBACK_SECRET)"
+        )
+
+    endpoint = f"{RENDER_FALLBACK_URL}/internal/render-fallback"
+    headers = {"Authorization": f"Bearer {RENDER_FALLBACK_SECRET}"}
+    data = {
+        "kind": kind,
+        "job_id": str(job_id),
+        "user_id": "" if user_id is None else str(user_id),
+        "notify": "1" if notify else "0",
+    }
+
+    job = get_job(job_id)
+    if job:
+        # نسخة من بيانات المهمة تجعل الاستقبال قادرًا على إعادة إنشائها
+        # لو كانت قاعدة البيانات مشتركة لكن الصف لم يصل بعد.
+        data["job_data"] = json.dumps(
+            job, ensure_ascii=False, default=str
+        )
+
+    if kind == "upload":
+        path = Path(file_path)
+        if not path.exists():
+            raise RuntimeError("Upload file is missing before fallback")
+        with path.open("rb") as handle:
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                data=data,
+                files={
+                    "file": (
+                        path.name,
+                        handle,
+                        "application/octet-stream",
+                    )
+                },
+                timeout=RENDER_FALLBACK_TIMEOUT,
+            )
+    else:
+        if attachment is not None:
+            data["attachment"] = json.dumps(
+                attachment, ensure_ascii=False, default=str
+            )
+        if url is not None:
+            data["url"] = str(url)
+        if transcript is not None:
+            data["transcript"] = str(transcript)
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            data=data,
+            timeout=RENDER_FALLBACK_TIMEOUT,
+        )
+
+    if response.status_code not in (200, 202):
+        raise RuntimeError(
+            "Render fallback HTTP "
+            f"{response.status_code}: {response.text[:300]}"
+        )
+    return True
+
+
+def _cleanup_local_after_remote_dispatch(kind, job_id):
+    """حذف الملفات المحلية للحاوية بعد نجاح تسليم المهمة إلى Modal/Render."""
+    if kind in {"upload", "bot", "url"}:
+        cleanup_job_workdir(job_id)
+
+
+def _mark_dispatch_failure(job_id, error):
+    """فشل Modal وRender معًا: خطأ واضح + تنظيف إلزامي."""
+    message = (
+        "تعذّر تشغيل المهمة على Modal، ولا يوجد مسار احتياطي متاح. "
+        f"التفاصيل: {error}"
+    )
+    print(f"[DISPATCH FAILED] job {job_id}: {message}", flush=True)
+    try:
+        update_job(
+            job_id,
+            status="failed",
+            stage="error",
+            error=message,
+            processing_backend="none",
+        )
+    except Exception as db_error:
+        print(
+            f"[DISPATCH FAILED] could not update job {job_id}: {db_error}",
+            flush=True,
+        )
+    try:
+        log_transcription_failure(job_id)
+    except Exception:
+        pass
+    try:
+        update_status_message(job_id, f"❌ {message}")
+    except Exception:
+        pass
+    cleanup_job_workdir(job_id)
+
+
+def dispatch_heavy_job(
+    kind,
+    job_id,
+    user_id,
+    *,
+    file_path=None,
+    attachment=None,
+    url=None,
+    notify=True,
+    transcript=None,
+):
+    """توزيع مهمة ثقيلة مع Modal كمسار أساسي.
+
+    kind:
+      - upload: ملف مرفوع من صفحة الويب (bytes إلى دالة Modal).
+      - bot: مرفق تيليجرام (العاملة تنزّله بنفسها).
+      - url: رابط (العاملة تنزّله بنفسها).
+      - deepgram_finalize: نتيجة callback من Deepgram (العاملة تحفظها وترسلها).
+    """
+    if kind not in {"upload", "bot", "url", "deepgram_finalize"}:
+        raise ValueError(f"Unknown heavy job kind: {kind}")
+
+    if MODAL_DISPATCH_ENABLED:
+        # 1) تجهيز الحمولة محليًا. فشله خطأ محلي، ولا مبرر لإرساله إلى Render.
+        try:
+            import modal_app
+
+            payload = {
+                "job_id": str(job_id),
+                "kind": kind,
+                "user_id": "" if user_id is None else str(user_id),
+                "notify": bool(notify),
+            }
+            if kind == "upload":
+                path = Path(file_path)
+                payload["filename"] = path.name
+                payload["file_bytes"] = path.read_bytes()
+            elif kind == "bot":
+                payload["attachment"] = attachment or {}
+            elif kind == "url":
+                payload["url"] = str(url)
+            elif kind == "deepgram_finalize":
+                payload["transcript"] = str(transcript or "")
+        except Exception as payload_error:
+            print(
+                f"[MODAL DISPATCH] job {job_id} ({kind}) payload failed: "
+                f"{type(payload_error).__name__}: {payload_error}",
+                flush=True,
+            )
+            _mark_dispatch_failure(job_id, f"Payload: {payload_error}")
+            return "failed"
+
+        # 2) استدعاء Modal. فقط فشل هذا الاستدعاء يفعّل Render.
+        try:
+            handle = modal_app.process_job.spawn(payload)
+        except Exception as modal_error:
+            print(
+                f"[MODAL DISPATCH] job {job_id} ({kind}) failed: "
+                f"{type(modal_error).__name__}: {modal_error}",
+                flush=True,
+            )
+            try:
+                update_job(
+                    job_id,
+                    modal_dispatch_error=(
+                        f"{type(modal_error).__name__}: {modal_error}"
+                    )[:600],
+                )
+            except Exception:
+                pass
+
+            if _render_fallback_ready():
+                try:
+                    _post_render_fallback(
+                        kind,
+                        job_id,
+                        user_id,
+                        file_path=file_path,
+                        attachment=attachment,
+                        url=url,
+                        notify=notify,
+                        transcript=transcript,
+                    )
+                    try:
+                        update_job(
+                            job_id,
+                            processing_backend="render_fallback",
+                            render_fallback_used=True,
+                        )
+                    except Exception as bookkeeping_error:
+                        print(
+                            f"[RENDER FALLBACK] bookkeeping warning for "
+                            f"{job_id}: {bookkeeping_error}",
+                            flush=True,
+                        )
+                    _cleanup_local_after_remote_dispatch(kind, job_id)
+                    print(
+                        f"[RENDER FALLBACK] job {job_id} ({kind}) accepted",
+                        flush=True,
+                    )
+                    return "render_fallback"
+                except Exception as render_error:
+                    print(
+                        f"[RENDER FALLBACK] job {job_id} ({kind}) failed: "
+                        f"{type(render_error).__name__}: {render_error}",
+                        flush=True,
+                    )
+                    _mark_dispatch_failure(
+                        job_id,
+                        f"Modal: {modal_error}; Render: {render_error}",
+                    )
+                    return "failed"
+
+            _mark_dispatch_failure(job_id, f"Modal: {modal_error}")
+            return "failed"
+
+        # 3) نجح الإرسال إلى Modal. أي فشل في تحديث السجل أو تنظيف الحاوية
+        #    لا يجوز أن يفعّل Render، وإلا نُفّذت المهمة مرتين.
+        call_id = getattr(handle, "object_id", None)
+        try:
+            update_job(
+                job_id,
+                processing_backend="modal",
+                modal_call_id=call_id,
+                modal_dispatch_error=None,
+            )
+        except Exception as bookkeeping_error:
+            print(
+                f"[MODAL DISPATCH] bookkeeping warning for {job_id}: "
+                f"{bookkeeping_error}",
+                flush=True,
+            )
+        _cleanup_local_after_remote_dispatch(kind, job_id)
+        print(
+            f"[MODAL DISPATCH] job {job_id} ({kind}) -> {call_id}",
+            flush=True,
+        )
+        return "modal"
+
+    # التشغيل المحلي / Render الأساسي القديم: الطابور داخل العملية كما هو.
+    try:
+        if kind == "upload":
+            job_queue.enqueue(
+                job_id,
+                process_transcription_job,
+                job_id,
+                Path(file_path),
+                user_id=user_id,
+            )
+        elif kind == "bot":
+            destination = (
+                get_work_dir(job_id)
+                / "original"
+                / _safe_upload_name(
+                    (attachment or {}).get("file_name")
+                )
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            job_queue.enqueue(
+                job_id,
+                run_bot_job,
+                job_id,
+                attachment or {},
+                destination,
+                user_id=user_id,
+            )
+        elif kind == "url":
+            destination = get_work_dir(job_id) / "original"
+            destination.mkdir(parents=True, exist_ok=True)
+            job_queue.enqueue(
+                job_id,
+                run_url_job,
+                job_id,
+                str(url),
+                destination,
+                bool(notify),
+                user_id=user_id,
+            )
+        elif kind == "deepgram_finalize":
+            job_queue.enqueue(
+                job_id,
+                finalize_transcript,
+                job_id,
+                str(transcript or ""),
+                "deepgram",
+                user_id=user_id,
+            )
+        update_job(job_id, processing_backend="local_queue")
+        return "local_queue"
+    except Exception as local_error:
+        print(
+            f"[LOCAL QUEUE] job {job_id} ({kind}) failed: "
+            f"{type(local_error).__name__}: {local_error}",
+            flush=True,
+        )
+        _mark_dispatch_failure(job_id, f"Local queue: {local_error}")
+        return "failed"
+
+
+def dispatch_deepgram_finalize(job_id, transcript, user_id):
+    """إنهاء مهمة Deepgram في دالة Modal خلفية، مع احتياط Render ثم محلي.
+
+    الـ callback نفسه يجب أن يرد بسرعة على Deepgram، ولذلك لا نُنهي النص
+    داخل طلب الويب إن كان Modal متاحًا.
+    """
+    if MODAL_DISPATCH_ENABLED:
+        try:
+            import modal_app
+
+            handle = modal_app.process_job.spawn({
+                "job_id": str(job_id),
+                "kind": "deepgram_finalize",
+                "user_id": "" if user_id is None else str(user_id),
+                "transcript": str(transcript or ""),
+                "notify": True,
+            })
+        except Exception as modal_error:
+            print(
+                f"[MODAL DISPATCH] deepgram finalize {job_id} failed: "
+                f"{type(modal_error).__name__}: {modal_error}",
+                flush=True,
+            )
+            try:
+                update_job(
+                    job_id,
+                    modal_dispatch_error=(
+                        f"{type(modal_error).__name__}: {modal_error}"
+                    )[:600],
+                )
+            except Exception:
+                pass
+
+            if _render_fallback_ready():
+                try:
+                    _post_render_fallback(
+                        "deepgram_finalize",
+                        job_id,
+                        user_id,
+                        transcript=transcript,
+                    )
+                    try:
+                        update_job(
+                            job_id,
+                            processing_backend="render_fallback",
+                            render_fallback_used=True,
+                            stage="finalizing",
+                        )
+                    except Exception as bookkeeping_error:
+                        print(
+                            f"[RENDER FALLBACK] bookkeeping warning for "
+                            f"{job_id}: {bookkeeping_error}",
+                            flush=True,
+                        )
+                    return "render_fallback"
+                except Exception as render_error:
+                    print(
+                        f"[RENDER FALLBACK] deepgram finalize {job_id} "
+                        f"failed: {type(render_error).__name__}: "
+                        f"{render_error}",
+                        flush=True,
+                    )
+        else:
+            # نجح الإرسال إلى Modal؛ لا نفعّل Render حتى لو تعثر تحديث السجل.
+            try:
+                update_job(
+                    job_id,
+                    processing_backend="modal",
+                    modal_call_id=getattr(handle, "object_id", None),
+                    stage="finalizing",
+                )
+            except Exception as bookkeeping_error:
+                print(
+                    f"[MODAL DISPATCH] deepgram bookkeeping warning for "
+                    f"{job_id}: {bookkeeping_error}",
+                    flush=True,
+                )
+            return "modal"
+
+    # الملاذ الأخير: الحاوية الحالية على قيد الحياة، فلا نضيّع النص.
+    # قد يستغرق التنقيح، لكن الأهم حفظ النص الخام وإرساله.
+    print(
+        f"[DEEPGRAM] Finalizing job {job_id} locally as last resort",
+        flush=True,
+    )
+    finalize_transcript(job_id, transcript, engine="deepgram")
+    return "local"
+
 
 # ============================================================
 # محرك Cohere الأساسي + Deepgram كخط احتياط
@@ -2172,15 +2663,28 @@ def finalize_transcript(job_id, transcript, engine):
     log_transcription_success(job_id)
 
     # --- إطلاق التنقيح التلقائي في الخلفية (لا يوقف الرد) ---
+    # داخل دالة Modal الخلفية ننفّذه بشكل متزامن: الحاوية قد تُجمّد بعد
+    # إرجاع الدالة، والخيط الخفي قد لا يكمل. على الويب/Render يبقى كخيط
+    # كما هو حفاظًا على سرعة الرد.
     if REFINE_ENABLED:
         try:
-            thread = threading.Thread(
-                target=send_refined_versions_async,
-                args=(job_id, str(output_file)),
-                daemon=True
-            )
-            thread.start()
-            print(f"[AUTO-REFINE] Thread started for job {job_id}", flush=True)
+            if _truthy(os.environ.get("WAQQAD_SYNC_REFINE"), False):
+                print(
+                    f"[AUTO-REFINE] Running synchronously for job {job_id}",
+                    flush=True,
+                )
+                send_refined_versions_async(job_id, str(output_file))
+            else:
+                thread = threading.Thread(
+                    target=send_refined_versions_async,
+                    args=(job_id, str(output_file)),
+                    daemon=True
+                )
+                thread.start()
+                print(
+                    f"[AUTO-REFINE] Thread started for job {job_id}",
+                    flush=True,
+                )
         except Exception as e:
             print(f"[AUTO-REFINE] Failed to start thread: {e}", flush=True)
             cleanup_job_workdir(job_id)
@@ -2634,6 +3138,19 @@ def process_transcription_job(job_id, input_file):
             parts_dir,
             ignore_errors=True
         )
+        # على المسار المحلي/الاحتياطي لا توجد حاوية Modal تُنظّف لاحقًا؛
+        # نزيل مجلد العمل فور الفشل. النجاح يُنظّفه finalize_transcript
+        # بعد انتهاء التنقيح، فلا نلمس ملفات نسخة قيد الإرسال.
+        try:
+            current_job = get_job(job_id) or {}
+            if current_job.get("status") == "failed":
+                cleanup_job_workdir(job_id)
+        except Exception as cleanup_error:
+            print(
+                f"[CLEANUP] job {job_id} failure cleanup warning: "
+                f"{cleanup_error}",
+                flush=True,
+            )
 
 
 def transcript_download_name(original_filename):
@@ -4004,10 +4521,7 @@ def handle_bot_attachment(chat, sender, attachment):
         return
 
     job_id = str(uuid.uuid4())
-    original_dir = get_work_dir(job_id) / "original"
-    original_dir.mkdir(parents=True, exist_ok=True)
     safe_name = _safe_upload_name(attachment.get("file_name"))
-    destination = (original_dir / safe_name).resolve()
 
     create_job(
         job_id,
@@ -4039,29 +4553,12 @@ def handle_bot_attachment(chat, sender, attachment):
         "يمكنك إغلاق المحادثة، وستصل النتيجة هنا."
     )
 
-    try:
-        job_queue.enqueue(
-            job_id,
-            run_bot_job,
-            job_id,
-            attachment,
-            destination,
-            user_id=str(user_id)
-        )
-    except Exception as e:
-        print(f"[QUEUE ERROR] job {job_id}: {e}", flush=True)
-        update_job(
-            job_id,
-            status="failed",
-            stage="error",
-            error=f"enqueue failed: {e}"
-        )
-        update_status_message(
-            job_id,
-            f"❌ {attachment.get('file_name')}: تعذّر إدخال الملف "
-            "في الطابور. أعد المحاولة."
-        )
-        log_transcription_failure(job_id)
+    dispatch_heavy_job(
+        "bot",
+        job_id,
+        str(user_id),
+        attachment=attachment,
+    )
 
 
 def create_url_job(url, user_id, sender, source):
@@ -4212,7 +4709,18 @@ def run_url_job(job_id, url, destination, notify=True):
         )
     finally:
         # الملف المنزَّل قد يبلغ 150MB، فلا نُبقيه بعد النجاح أو الفشل.
-        shutil.rmtree(destination.parent, ignore_errors=True)
+        # destination مجلد original فقط؛ لا نحذف جذر المهمة كي تبقى
+        # نسخة التنقيح/الناتج متاحة إن كان خيطها ما زال يعمل.
+        shutil.rmtree(destination, ignore_errors=True)
+        try:
+            current_job = get_job(job_id) or {}
+            if current_job.get("status") == "failed":
+                cleanup_job_workdir(job_id)
+        except Exception as cleanup_error:
+            print(
+                f"[URL CLEANUP] job {job_id}: {cleanup_error}",
+                flush=True,
+            )
 
 
 def handle_bot_url(chat, sender, url):
@@ -4227,7 +4735,7 @@ def handle_bot_url(chat, sender, url):
         )
         return
 
-    job_id, destination = create_url_job(
+    job_id, _destination = create_url_job(
         url,
         user_id,
         sender,
@@ -4244,26 +4752,13 @@ def handle_bot_url(chat, sender, url):
         "يمكنك إغلاق المحادثة."
     )
 
-    try:
-        job_queue.enqueue(
-            job_id,
-            run_url_job,
-            job_id,
-            url,
-            destination,
-            True,
-            user_id=str(user_id)
-        )
-    except Exception as e:
-        print(f"[QUEUE ERROR] url job {job_id}: {e}", flush=True)
-        _fail_url_job(
-            job_id,
-            display_name,
-            f"enqueue failed: {e}",
-            True,
-            f"❌ {display_name}: تعذّر إدخال الرابط في الطابور. "
-            "أعد المحاولة."
-        )
+    dispatch_heavy_job(
+        "url",
+        job_id,
+        str(user_id),
+        url=url,
+        notify=True,
+    )
 
 
 def run_bot_job(job_id, attachment, destination):
@@ -4348,6 +4843,19 @@ def run_bot_job(job_id, attachment, destination):
             f"❌ {label}: حدث خطأ غير متوقع أثناء التجهيز.\n"
             "أعد المحاولة، وإن تكرر فأبلغنا عبر /about."
         )
+
+    finally:
+        # الملف الأصلي لا يلزم بعد انتهاء المعالجة؛ الناتج في جذر مجلد العمل.
+        shutil.rmtree(destination.parent, ignore_errors=True)
+        try:
+            current_job = get_job(job_id) or {}
+            if current_job.get("status") == "failed":
+                cleanup_job_workdir(job_id)
+        except Exception as cleanup_error:
+            print(
+                f"[BOT CLEANUP] job {job_id}: {cleanup_error}",
+                flush=True,
+            )
 
 
 def handle_find(chat_id, user_id, query):
@@ -5065,17 +5573,27 @@ def transcribe():
         )
     )
 
-    job_queue.enqueue(
+    dispatch_result = dispatch_heavy_job(
+        "upload",
         job_id,
-        process_transcription_job,
-        job_id,
-        input_file,
-        user_id=telegram_user_id
+        telegram_user_id,
+        file_path=input_file,
     )
+
+    if dispatch_result == "failed":
+        return jsonify({
+            "job_id": job_id,
+            "status": "failed",
+            "error": (
+                "تعذّر تشغيل المهمة على Modal، ولا يوجد مسار احتياطي متاح. "
+                "أعد المحاولة لاحقًا."
+            ),
+        }), 503
 
     return jsonify({
         "job_id": job_id,
         "status": "queued",
+        "backend": dispatch_result,
         "message":
             "Transcription job started."
     }), 202
@@ -5101,26 +5619,35 @@ def transcribe_url():
         }), 400
 
     telegram_user_id = str(tg_user["id"])
-    job_id, destination = create_url_job(
+    job_id, _destination = create_url_job(
         url,
         telegram_user_id,
         tg_user,
         source="web_url"
     )
 
-    job_queue.enqueue(
+    dispatch_result = dispatch_heavy_job(
+        "url",
         job_id,
-        run_url_job,
-        job_id,
-        url,
-        destination,
-        False,
-        user_id=telegram_user_id
+        telegram_user_id,
+        url=url,
+        notify=False,
     )
+
+    if dispatch_result == "failed":
+        return jsonify({
+            "job_id": job_id,
+            "status": "failed",
+            "error": (
+                "تعذّر تشغيل مهمة الرابط على Modal، "
+                "ولا يوجد مسار احتياطي متاح."
+            ),
+        }), 503
 
     return jsonify({
         "job_id": job_id,
         "status": "queued",
+        "backend": dispatch_result,
         "message": "URL transcription job started."
     }), 202
 
@@ -5214,20 +5741,21 @@ def deepgram_callback(job_id):
             "error": "bad payload"
         }), 400
 
-    finalize_transcript(
+    dispatch_result = dispatch_deepgram_finalize(
         job_id,
         transcript,
-        engine="deepgram"
+        job.get("telegram_user_id"),
     )
 
     print(
-        f"[CALLBACK] Job {job_id} "
-        f"completed successfully via Deepgram.",
+        f"[CALLBACK] Job {job_id} accepted via Deepgram "
+        f"(finalize={dispatch_result}).",
         flush=True
     )
 
     return jsonify({
-        "status": "ok"
+        "status": "ok",
+        "finalize": dispatch_result,
     }), 200
 
 
@@ -5314,24 +5842,190 @@ def download_result(job_id):
     output_file = job.get(
         "output_file"
     )
-
-    if (
-        not output_file
-        or not os.path.exists(output_file)
-    ):
-
-        return jsonify({
-            "error":
-                "Output file not found"
-        }), 404
-
-    return send_file(
-        output_file,
-        as_attachment=True,
-        download_name=
-            job.get("output_name", "transcription.txt"),
-        mimetype="text/plain"
+    download_name = job.get(
+        "output_name",
+        transcript_download_name(job.get("original_filename"))
     )
+
+    # على Modal تُكتب النتيجة في حاوية العامل لا في حاوية الويب.
+    # النص محفوظ في PostgreSQL، فنستخدمه كبديل آمن للتنزيل.
+    if output_file and os.path.exists(output_file):
+        return send_file(
+            output_file,
+            as_attachment=True,
+            download_name=download_name,
+            mimetype="text/plain"
+        )
+
+    row = transcript_store.get_transcript(job_id, "raw")
+    content = (row or {}).get("content")
+    if content:
+        return send_file(
+            io.BytesIO(content.encode("utf-8")),
+            as_attachment=True,
+            download_name=download_name,
+            mimetype="text/plain"
+        )
+
+    return jsonify({
+        "error":
+            "Output file not found"
+    }), 404
+
+
+# ============================================================
+# مستقبل Render الاحتياطي (طوارئ فقط)
+# ============================================================
+#
+# هذه النقطة لا تُستدعى إلا من dispatch_heavy_job بعد فشل Modal بالكامل.
+# محمية بسر مشترك، وتضع المهمة في طابور العملية المحلية لخدمة Render.
+# لا تعيد الإرسال إلى Modal مطلقًا، حتى لا تحدث حلقة تبادل.
+
+@app.route(
+    "/internal/render-fallback",
+    methods=["POST"]
+)
+def render_fallback_receive():
+    if not RENDER_FALLBACK_SECRET:
+        return jsonify({
+            "error": (
+                "Render fallback receiver is disabled: "
+                "RENDER_FALLBACK_SECRET is not configured"
+            )
+        }), 503
+
+    authorization = request.headers.get("Authorization", "")
+    expected = f"Bearer {RENDER_FALLBACK_SECRET}"
+    if not hmac.compare_digest(authorization, expected):
+        return jsonify({"error": "forbidden"}), 403
+
+    kind = (request.form.get("kind") or "").strip()
+    job_id = (request.form.get("job_id") or "").strip()
+    user_id = (request.form.get("user_id") or "").strip() or None
+    notify = request.form.get("notify", "1") not in {
+        "0", "false", "False", ""
+    }
+
+    if kind not in {"upload", "bot", "url", "deepgram_finalize"}:
+        return jsonify({"error": "invalid kind"}), 400
+    if not job_id:
+        return jsonify({"error": "missing job_id"}), 400
+
+    job = get_job(job_id)
+    job_data_raw = request.form.get("job_data")
+    if job is None and job_data_raw:
+        try:
+            create_job(job_id, json.loads(job_data_raw))
+            job = get_job(job_id)
+        except Exception as e:
+            print(
+                f"[RENDER FALLBACK] could not restore job {job_id}: {e}",
+                flush=True,
+            )
+
+    if job is None:
+        return jsonify({"error": "unknown job"}), 404
+
+    if job.get("status") in {"completed", "failed"}:
+        return jsonify({
+            "status": "ignored",
+            "reason": f"job already {job.get('status')}",
+        }), 200
+
+    update_job(
+        job_id,
+        processing_backend="render_fallback",
+        render_fallback_used=True,
+    )
+
+    try:
+        if kind == "upload":
+            uploaded = request.files.get("file")
+            if uploaded is None:
+                return jsonify({"error": "missing file"}), 400
+
+            safe_name = _safe_upload_name(
+                uploaded.filename or job.get("original_filename")
+            )
+            destination = get_work_dir(job_id) / "original" / safe_name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            uploaded.save(destination)
+            update_job(
+                job_id,
+                file_size_bytes=destination.stat().st_size,
+                stage="processing",
+            )
+            job_queue.enqueue(
+                job_id,
+                process_transcription_job,
+                job_id,
+                destination,
+                user_id=user_id,
+            )
+
+        elif kind == "bot":
+            attachment = json.loads(
+                request.form.get("attachment") or "{}"
+            )
+            destination = (
+                get_work_dir(job_id)
+                / "original"
+                / _safe_upload_name(attachment.get("file_name"))
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            job_queue.enqueue(
+                job_id,
+                run_bot_job,
+                job_id,
+                attachment,
+                destination,
+                user_id=user_id,
+            )
+
+        elif kind == "url":
+            url = (request.form.get("url") or "").strip()
+            if not url_media.is_url(url):
+                return jsonify({"error": "invalid url"}), 400
+            destination = get_work_dir(job_id) / "original"
+            destination.mkdir(parents=True, exist_ok=True)
+            job_queue.enqueue(
+                job_id,
+                run_url_job,
+                job_id,
+                url,
+                destination,
+                notify,
+                user_id=user_id,
+            )
+
+        else:  # deepgram_finalize
+            transcript = request.form.get("transcript")
+            if transcript is None:
+                return jsonify({"error": "missing transcript"}), 400
+            job_queue.enqueue(
+                job_id,
+                finalize_transcript,
+                job_id,
+                transcript,
+                "deepgram",
+                user_id=user_id,
+            )
+
+    except Exception as e:
+        print(
+            f"[RENDER FALLBACK] receiver failed for {job_id}: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
+        _mark_dispatch_failure(job_id, f"Render receiver: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "status": "accepted",
+        "backend": "render_fallback",
+        "job_id": job_id,
+    }), 202
+
 
 @app.route(
     "/telegram/transcriber",
@@ -5451,17 +6145,35 @@ def refine_job(job_id):
         return jsonify({"error": "Job not found"}), 404
 
     output_file = job.get("output_file")
-    if not output_file or not os.path.exists(output_file):
-        return jsonify({"error": "Output file not found - job may have expired"}), 404
+
+    # على Modal قد لا يوجد الملف في حاوية الويب؛ النص الخام محفوظ في القاعدة.
+    if output_file and os.path.exists(output_file):
+        raw_text = Path(output_file).read_text(encoding="utf-8")
+    else:
+        row = transcript_store.get_transcript(job_id, "raw")
+        raw_text = (row or {}).get("content") or ""
+
+    if not raw_text.strip():
+        return jsonify({
+            "error": "Output file not found - job may have expired"
+        }), 404
 
     try:
-        raw_text = Path(output_file).read_text(encoding="utf-8")
-        if not raw_text.strip():
-            return jsonify({"error": "Empty transcript"}), 400
-
         refined = refine_arabic_text(raw_text)
 
-        refined_path = Path(output_file).with_name(Path(output_file).stem + "_refined.txt")
+        if output_file:
+            refined_path = Path(output_file).with_name(
+                Path(output_file).stem + "_refined.txt"
+            )
+        else:
+            work_dir = get_work_dir(job_id)
+            work_dir.mkdir(parents=True, exist_ok=True)
+            refined_path = work_dir / (
+                Path(transcript_download_name(
+                    job.get("original_filename")
+                )).stem + "_refined.txt"
+            )
+        refined_path.parent.mkdir(parents=True, exist_ok=True)
         refined_path.write_text(refined, encoding="utf-8")
 
         telegram_user_id = job.get("telegram_user_id")
@@ -5481,6 +6193,10 @@ def refine_job(job_id):
     except Exception as e:
         print(f"[REFINE ERROR] job {job_id}: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
+    finally:
+        # حاوية Modal للويب مؤقتة؛ لا نُبقي أي ملف بعد انتهاء الطلب.
+        if MODAL_RUNTIME:
+            cleanup_job_workdir(job_id)
 
 
 try:
