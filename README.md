@@ -32,7 +32,53 @@ python app.py
 
 ## النشر
 
-المشروع مهيأ للنشر على Render عبر `Dockerfile`:
+### Modal هو المسار الأساسي
+
+الملف `modal_app.py` هو نقطة النشر الأساسية. يفصل بين:
+
+- **نقطة الويب السريعة** `web`: تطبيق Flask نفسه عبر `modal.asgi_app` وFastAPI/WSGI، للرد على ويبهوك تيليجرام وطلبات الرفع والحالة والتنزيل والتصدير.
+- **دالة المعالجة الثقيلة** `process_job`: دالة Modal مستقلة بمهلة تصل إلى 6 ساعات، تنزّل ملفات تيليجرام/الروابط، وتشغّل ffmpeg، وتفرّغ عبر Cohere ثم Deepgram، وتنقّح، وترسل النتيجة. تنظّف مجلد العمل في `finally` في جميع الحالات.
+
+```bash
+# مرة واحدة: إنشاء سر يحتوي متغيرات البيئة
+modal secret create waqqad-transcriber-env \
+  DATABASE_URL=... TELEGRAM_BOT_TOKEN=... COHERE_API_KEYS=... \
+  DEEPGRAM_API_KEY=... GEMINI_API_KEY=... BASE_URL=https://...
+
+# النشر
+pip install "modal>=1.0,<2.0"
+modal deploy modal_app.py
+```
+
+بعد أول نشر، خذ رابط `web` من مخرجات Modal وضعه في `BASE_URL` داخل السر، ثم أعد النشر وسجّل ويبهوك تيليجرام على:
+
+```
+https://<workspace>--waqqad-transcriber-web.modal.run/telegram/transcriber
+```
+
+النشر التلقائي عبر `.github/workflows/deploy.yml` عند الدفع إلى `main` أو تشغيله يدويًا. أضف في أسرار المستودع:
+
+- `MODAL_TOKEN_ID`
+- `MODAL_TOKEN_SECRET`
+
+ويمكن ضبط `MODAL_SECRET_NAMES` و`MODAL_APP_NAME` كمتغيرات مستودع (Repository variables) اختيارًا.
+
+### Render طوارئ أخيرة فقط
+
+خدمة Render القديمة تبقى قادرة على العمل، لكنها **لا تُستخدم إلا إذا فشل Modal بالكامل** (استثناء اتصال/مهلة/فشل تشغيل دالة Modal/تعطل نقطة الاستقبال). لا يوجد أي تفريق حسب مدة الملف أو حجمه: حتى الملف القصير يذهب إلى Modal أولًا.
+
+لتفعيل الاحتياطي:
+
+1. انشر المشروع نفسه على Render مع نفس `DATABASE_URL`.
+2. اضبط على Render: `RENDER_FALLBACK_SECRET`، و`WAQQAD_RENDER_FALLBACK_MODE=1`، و`WAQQAD_DISABLE_MODAL_DISPATCH=1`.
+3. اضبط على Modal: `RENDER_FALLBACK_URL=https://<render-service>.onrender.com` و`RENDER_FALLBACK_SECRET` (نفس القيمة)، و`RENDER_FALLBACK_ENABLED=1`.
+4. إن تعطل Modal كليًا، وجّه ويبهوك تيليجرام يدويًا إلى Render (نفس مسار `/telegram/transcriber`)؛ سيعمل Render بطابوره المحلي لأن `WAQQAD_DISABLE_MODAL_DISPATCH=1`.
+
+إن لم يُضبط `RENDER_FALLBACK_URL` أو فشل Render أيضًا، تُعلَّم المهمة فاشلة برسالة واضحة، ويُحذف مجلد العمل المؤقت. التفاصيل الكاملة وخطة التراجع في [`docs/modal-deployment.md`](docs/modal-deployment.md).
+
+### Render كخدمة Docker مباشرة
+
+المشروع ما زال مهيأ للنشر على Render عبر `Dockerfile`:
 
 - المنفذ: `10000`
 - فحص الصحة: `/health`
@@ -48,9 +94,18 @@ python app.py
 | `COHERE_API_KEYS` | مفتاح أو مفاتيح Cohere مفصولة بفواصل |
 | `COHERE_API_KEY` | بديل لمفتاح واحد |
 | `GEMINI_API_KEY` | مفتاح تنقية النص |
-| `BASE_URL` | رابط الخدمة العام |
+| `BASE_URL` | رابط الخدمة العام (رابط Modal `web` في الوضع الأساسي) |
 | `TRANSCRIBER_WEBAPP_URL` | رابط صفحة التفريغ |
 | `TRANSCRIBER_LOG_CHAT_ID` | محادثة سجلات وأرشيف (اختياري) |
+| `WAQQAD_MODAL_MODE` | `1` داخل صورة Modal: يفعّل توزيع المهام إلى دالة Modal |
+| `WAQQAD_DISABLE_MODAL_DISPATCH` | `1` على Render الاحتياطي: يمنع أي محاولة إرسال إلى Modal |
+| `RENDER_FALLBACK_URL` | رابط خدمة Render الاحتياطية (فارغ = تعطيل الاحتياطي) |
+| `RENDER_FALLBACK_ENABLED` | `1` لتفعيل الاحتياطي عند ضبط الرابط، `0` لتعطيله |
+| `RENDER_FALLBACK_SECRET` | سر مشترك بين Modal وRender لحماية نقطة الاستقبال |
+| `RENDER_FALLBACK_TIMEOUT` | مهلة إرسال المهمة إلى Render بالثواني (افتراضي 180) |
+| `WAQQAD_RENDER_FALLBACK_MODE` | `1` على Render فقط: يمنع فحص المهام المعلقة عند الإقلاع |
+| `MODAL_SECRET_NAMES` | أسماء أسرار Modal مفصولة بفواصل (افتراضي `waqqad-transcriber-env`) |
+| `MODAL_APP_NAME` | اسم تطبيق Modal (افتراضي `waqqad-transcriber`) |
 | `TRANSCRIBER_MAX_UPLOAD_MB` | أكبر ملف يقبله البوت في المحادثة (افتراضي 20) |
 | `TRANSCRIBER_QUEUE_WORKERS` | عدد مهام التفريغ المتوازية (افتراضي 2) |
 | `TRANSCRIBER_URL_MAX_MB` | أكبر ملف يُنزَّل من رابط (افتراضي 150) |
@@ -150,7 +205,9 @@ curl -X POST "https://api.telegram.org/bot<WARRAQ_BOT_TOKEN>/setWebhook" \
 | `warraq_miniapp.py` | واجهات Mini App للورّاق |
 | `warraq.html` | صفحة واجهة الورّاق |
 | `refine.py` | تنقية النص عبر Gemini |
-| `Dockerfile` | صورة النشر |
+| `modal_app.py` | نشر Modal: صورة ffmpeg، نقطة ASGI، ودالة المعالجة الثقيلة |
+| `.github/workflows/deploy.yml` | نشر Modal تلقائيًا عند الدفع إلى `main` أو يدويًا |
+| `Dockerfile` | صورة النشر على Render/الاستضافة التقليدية |
 
 ## التدقيق التلقائي
 
@@ -174,8 +231,10 @@ curl -X POST "https://api.telegram.org/bot<WARRAQ_BOT_TOKEN>/setWebhook" \
 
 - نتائج التفريغ تُرسل إلى محادثة المستخدم في تيليجرام، والملف المؤقت في `/tmp` للتنزيل فقط.
 - رسالة الحالة تتطور في مكانها: استلام → تنزيل → تفريغ، ثم تُحذف عند وصول النتيجة. لا تتراكم رسائل لكل مرحلة.
-- عند إعادة تشغيل الخدمة تُعلَّم المهام غير المكتملة كفاشلة، وتُحذف مجلدات العمل القديمة.
-- لا توجد حدود على حجم الملف أو عدد الطلبات؛ حدود تيليجرام/Render نفسها تبقى مطبقة.
+- عند إعادة تشغيل الخدمة تُعلَّم المهام غير المكتملة كفاشلة، وتُحذف مجلدات العمل القديمة. على Modal تُتخطى هذه الخطوة في حاويات الويب/العاملات حتى لا تُعلَّم مهام الحاويات الأخرى بالفشل.
+- على Modal: نقطة الويب لا تكتب النتائج محليًا بشكل دائم؛ النص يُحفظ في PostgreSQL، و`/download` و`/refine` يقرآن منه عند غياب الملف المحلي.
+- على Modal: التنقيح التلقائي يعمل متزامنًا داخل دالة العامل (`WAQQAD_SYNC_REFINE=1`) لأن الحاوية قد تُجمّد بعد إرجاع الدالة.
+- لا توجد حدود على حجم الملف أو عدد الطلبات؛ حدود تيليجرام/Modal/Render نفسها تبقى مطبقة.
 
 ## الفريق والمساهمون
 
@@ -213,3 +272,12 @@ Backup-stable-30-10-2026
 git fetch origin
 git checkout Backup-stable-02-11-2026
 ```
+
+## خطة التراجع عن إضافة Modal
+
+- العمل في فرع مستقل: `feat/modal-primary-render-fallback-2026-11-26`.
+- التراجع الكامل عن الالتزام: `git revert <commit-sha>`.
+- إيقاف Modal: `modal app stop waqqad-transcriber`.
+- إعادة ويبهوك تيليجرام إلى Render عبر `setWebhook` على مسار `/telegram/transcriber`.
+- تعطيل الاحتياطي فورًا: `RENDER_FALLBACK_ENABLED=0` أو حذف `RENDER_FALLBACK_URL`.
+- التفاصيل الكاملة في [`docs/modal-deployment.md`](docs/modal-deployment.md).
